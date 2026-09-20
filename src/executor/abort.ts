@@ -3,6 +3,9 @@ import { Plan, ZombieUploadItem, validatePlan, readPlanFile } from "../planner/p
 import { createConcurrencyLimiter } from "../utils/concurrency.js";
 import { withRetry, RetryOptions } from "../utils/retry.js";
 import { S3Provider } from "../providers/detector.js";
+import { evaluateMutationCeiling } from "../safety/mutation-budget.js";
+import { executeCanaryGate, CanaryVerificationError } from "../safety/canary.js";
+import { CircuitBreaker } from "../circuit/breaker.js";
 
 export type AbortItemStatus = "ABORTED" | "SKIPPED_ALREADY_ABORTED" | "FAILED";
 
@@ -30,6 +33,7 @@ export interface AbortResult {
   bytesFreed: number;
   errors: AbortErrorItem[];
   items?: AbortResultItem[];
+  circuitBreaker?: CircuitBreaker;
 }
 
 export interface ExecuteOptions {
@@ -39,6 +43,11 @@ export interface ExecuteOptions {
   concurrencyLimit?: number;
   retryOptions?: RetryOptions;
   now?: Date;
+  estimatedInventory?: number;
+  bypassMutationCeiling?: boolean;
+  maxDeletionPercent?: number;
+  skipCanary?: boolean;
+  circuitBreaker?: CircuitBreaker;
   onProgress?: (
     completed: number,
     total: number,
@@ -112,8 +121,25 @@ export async function executeAbortPlan(
     }
   }
 
-  const concurrencyLimit = Math.min(options.concurrencyLimit ?? 10, 10);
-  const limiter = createConcurrencyLimiter(concurrencyLimit);
+  // 1. Relative Mutation Ceiling (Invariant 5)
+  const ceiling = evaluateMutationCeiling(
+    plan.uploads.length,
+    options.estimatedInventory ?? (plan as any).estimatedInventory,
+    {
+      maxPercent: options.maxDeletionPercent,
+      bypass: options.bypassMutationCeiling,
+    }
+  );
+  if (!ceiling.allowed) {
+    throw new Error(`Safety check failed: ${ceiling.reason}`);
+  }
+
+  // 2. Circuit Breaker initialization
+  const breaker =
+    options.circuitBreaker ??
+    new CircuitBreaker(plan.bucket, "AbortMultipartUpload", {
+      initialConcurrency: options.concurrencyLimit ?? 10,
+    });
 
   let aborted = 0;
   let skipped = 0;
@@ -123,10 +149,176 @@ export async function executeAbortPlan(
   const errors: AbortErrorItem[] = [];
   const items: AbortResultItem[] = [];
   const total = plan.uploads.length;
+  let targetsToProcess = plan.uploads;
+
+  // 3. Canary Gate (Invariant 6)
+  if (!options.skipCanary && plan.uploads.length > 0) {
+    try {
+      const canaryResult = await executeCanaryGate(client, plan.bucket, plan.uploads, breaker, {
+        retryOptions: options.retryOptions,
+      });
+
+      for (const outcome of canaryResult.outcomes) {
+        completed++;
+        if (outcome.status === "ABORTED") {
+          aborted++;
+          bytesFreed += outcome.bytes ?? 0;
+          items.push({
+            key: outcome.key,
+            uploadId: outcome.uploadId ?? "",
+            status: "ABORTED",
+            bytes: outcome.bytes ?? 0,
+            requestId: outcome.requestId,
+          });
+          const target = canaryResult.canaryTargets.find((c: any) => c.uploadId === outcome.uploadId);
+          if (target) {
+            options.onProgress?.(completed, total, target, "ABORTED", { requestId: outcome.requestId });
+          }
+        } else if (outcome.status === "SKIPPED_ALREADY_ABORTED") {
+          skipped++;
+          items.push({
+            key: outcome.key,
+            uploadId: outcome.uploadId ?? "",
+            status: "SKIPPED_ALREADY_ABORTED",
+            bytes: 0,
+          });
+          const target = canaryResult.canaryTargets.find((c: any) => c.uploadId === outcome.uploadId);
+          if (target) {
+            options.onProgress?.(completed, total, target, "SKIPPED_ALREADY_ABORTED");
+          }
+        }
+      }
+
+      targetsToProcess = canaryResult.remainingTargets;
+    } catch (err: unknown) {
+      if (err instanceof CanaryVerificationError) {
+        const processedUploadIds = new Set<string>();
+
+        if (err.outcomes && err.outcomes.length > 0) {
+          for (const outcome of err.outcomes) {
+            if (outcome.uploadId) processedUploadIds.add(outcome.uploadId);
+            completed++;
+            if (outcome.status === "ABORTED") {
+              aborted++;
+              bytesFreed += outcome.bytes ?? 0;
+              items.push({
+                key: outcome.key,
+                uploadId: outcome.uploadId ?? "",
+                status: "ABORTED",
+                bytes: outcome.bytes ?? 0,
+                requestId: outcome.requestId,
+              });
+            } else if (outcome.status === "SKIPPED_ALREADY_ABORTED") {
+              skipped++;
+              items.push({
+                key: outcome.key,
+                uploadId: outcome.uploadId ?? "",
+                status: "SKIPPED_ALREADY_ABORTED",
+                bytes: 0,
+              });
+            } else if (outcome.status === "FAILED") {
+              failed++;
+              const errorMsg = outcome.error ?? err.message;
+              errors.push({
+                key: outcome.key,
+                uploadId: outcome.uploadId ?? "",
+                error: errorMsg,
+              });
+              items.push({
+                key: outcome.key,
+                uploadId: outcome.uploadId ?? "",
+                status: "FAILED",
+                bytes: 0,
+                error: errorMsg,
+              });
+            }
+          }
+        }
+
+        if (err.outcomes.length === 0 && err.errors && err.errors.length > 0) {
+          for (const e of err.errors) {
+            failed++;
+            completed++;
+            errors.push({
+              key: e.key,
+              uploadId: e.uploadId,
+              error: e.error,
+            });
+            items.push({
+              key: e.key,
+              uploadId: e.uploadId,
+              status: "FAILED",
+              bytes: 0,
+              error: e.error,
+            });
+          }
+        }
+
+        // Account for any remaining uploads not processed due to early canary halt
+        for (const item of plan.uploads) {
+          if (!processedUploadIds.has(item.uploadId) && !items.some((i) => i.uploadId === item.uploadId)) {
+            failed++;
+            completed++;
+            const reason = `Aborted due to canary failure: ${err.message}`;
+            errors.push({
+              key: item.key,
+              uploadId: item.uploadId,
+              error: reason,
+            });
+            items.push({
+              key: item.key,
+              uploadId: item.uploadId,
+              status: "FAILED",
+              bytes: 0,
+              error: reason,
+            });
+          }
+        }
+
+        return {
+          total,
+          aborted,
+          skipped,
+          failed,
+          bytesFreed,
+          errors,
+          items,
+          circuitBreaker: breaker,
+        };
+      }
+      throw err;
+    }
+  }
+
+  // 4. Batch loop with Circuit Breaker & dynamic concurrency
+  const initialLimit = Math.min(options.concurrencyLimit ?? 10, 10);
+  const limiter = createConcurrencyLimiter(initialLimit);
+  let breakerTripped = false;
 
   await Promise.all(
-    plan.uploads.map((item) =>
+    targetsToProcess.map((item) =>
       limiter(async () => {
+        if (breakerTripped || !breaker.canExecute()) {
+          breakerTripped = true;
+          failed++;
+          const status: AbortItemStatus = "FAILED";
+          const errorMessage = `Circuit breaker tripped to OPEN: ${breaker.getTripReason()}`;
+          errors.push({
+            key: item.key,
+            uploadId: item.uploadId,
+            error: errorMessage,
+          });
+          items.push({
+            key: item.key,
+            uploadId: item.uploadId,
+            status,
+            bytes: item.bytes,
+            error: errorMessage,
+          });
+          completed++;
+          return;
+        }
+
         let status: AbortItemStatus = "ABORTED";
         let errorMessage: string | undefined = undefined;
         let requestId: string | undefined = undefined;
@@ -149,6 +341,7 @@ export async function executeAbortPlan(
           extendedRequestId = res?.$metadata?.extendedRequestId;
           aborted++;
           bytesFreed += item.bytes;
+          breaker.recordSuccess();
         } catch (err: unknown) {
           if (isNoSuchUploadError(err)) {
             // Upload was completed or aborted externally since plan creation:
@@ -165,6 +358,10 @@ export async function executeAbortPlan(
               uploadId: item.uploadId,
               error: errorMessage,
             });
+            breaker.recordError(err);
+            if (breaker.getState() === "OPEN") {
+              breakerTripped = true;
+            }
           }
         } finally {
           completed++;
@@ -194,5 +391,6 @@ export async function executeAbortPlan(
     bytesFreed,
     errors,
     items,
+    circuitBreaker: breaker,
   };
 }

@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.3.0  
+**Version:** 1.6.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -435,3 +435,39 @@ The dashboard state is managed via a deterministic pure reducer `dashboardReduce
 
 ### 13.4 Storage Lens Instant Triage Integration
 When launched with `--lens <source>`, the dashboard bypasses live S3 bucket listing and immediately populates the fleet triage view from AWS Storage Lens CSV exports via `readStorageLensMetrics`, enabling instant macro-level governance with zero data-plane API overhead.
+
+---
+
+## 14. Autonomous Circuit Breakers, Canary Verification Gates & Mutation Ceilings (v1.6.0)
+
+### 14.1 Zero-Allocation Error Tracking (Volumetric Ring Buffer)
+To eliminate garbage collection (GC) churn during high-throughput mutation loops across hundreds of thousands of objects, error tracking is implemented via `VolumetricRingBuffer`:
+- Allocates a contiguous typed array buffer `new Float32Array(windowSize)` once on initialization.
+- Maintains an $O(1)$ circular write head index and running sum for instantaneous error rate calculation: `getErrorRate() = runningSum / count`.
+- Strictly zero dynamic array allocations, memory reallocations, or object wrappers during batch ingestion loops.
+
+### 14.2 Autonomous Circuit Breaker Architecture
+Each deletion execution pipeline is governed by a scoped `CircuitBreaker` instance parameterized by `(bucket, operation)` (`DeleteObjects` or `AbortMultipartUpload`):
+1. **Three-State Machine (`CLOSED`, `OPEN`, `HALF_OPEN`):**
+   - **`CLOSED`:** Normal operation. Concurrency dynamically adjusts based on S3 API response characteristics.
+   - **`OPEN`:** Execution halted immediately. In-flight tasks fail fast without sending further network mutations to S3. Exponential backoff cooldown ($5\text{s} \times 2^{\text{tripCount}-1}$, capped at 60s) governs recovery.
+   - **`HALF_OPEN`:** After cooldown expiry, admits exactly one isolated probe batch. Success transitions state back to `CLOSED`; failure immediately re-trips state to `OPEN`.
+2. **Deterministic Error Classification:**
+   - **403 AccessDenied / Forbidden:** Tracks consecutive permission failures. On 3 consecutive 403 results, trips to `OPEN` immediately. Blind retries on hard permission cliffs are strictly prohibited.
+   - **503 SlowDown / Throttling:** Halves active concurrency immediately (`Math.max(minConcurrency, Math.floor(current / 2))`). Trips to `OPEN` on burst throttling ($\ge 3$ throttle events within 5 seconds) or sustained moving error rate $> 10\%$.
+   - **400 BadDigest / Checksum Mismatch:** Indicates payload corruption or data-plane integrity degradation. Immediately trips to `OPEN` and activates bucket quarantine (`isQuarantined() = true`), preventing automatic recovery.
+3. **Unconditional Batch Error Inspection:**
+   S3 `DeleteObjectsCommand` returns HTTP 200 OK even when sub-keys fail due to permissions, locks, or throttling. The circuit breaker inspects `response.Errors` unconditionally on every batch.
+
+### 14.3 Relative Mutation Ceiling (FinOps Safety Invariant)
+To protect cloud storage fleets against accidental mass wipeouts caused by misconfigured wildcards or corrupted scanning filters:
+1. **Proportional Cap:** Caps autonomous deletions to $\le 5\%$ of total bucket inventory (`evaluateMutationCeiling`).
+2. **Absolute Fallback:** If total bucket inventory is unknown or zero, enforces a strict absolute fallback ceiling of 1,000 objects.
+3. **Explicit Override:** Exceeding this ceiling strictly requires the `--bypass-mutation-ceiling` CLI flag or a custom `--max-deletion-percent <pct>` threshold. Without bypass, execution halts cleanly with exit code 1 (`POLICY_VIOLATION`).
+
+### 14.4 Canary Verification Gate (Pre-Flight Probing)
+Before executing fleet batch deletion loops across thousands of objects:
+1. **Canary Selection:** Isolates up to 10 oldest targeted items (by `initiated` timestamp for multipart uploads or `LastModified` timestamp for object versions).
+2. **Isolated Canary Mutation:** Executes isolated deletion on the canary sample.
+3. **`HeadObject` Probe Verification:** Performs a `HeadObject` probe on each canary target to confirm deletion or delete marker placement prior to admitting the remaining fleet batch loop.
+4. **Failure Isolation:** Any failure during the canary phase immediately aborts execution, populates structured item outcomes (`ABORTED`, `SKIPPED_ALREADY_ABORTED`, `DELETED`, `FAILED`), and returns exit code 1 (`POLICY_VIOLATION`) without risking bulk mutation errors. Can be skipped when explicitly desired via `--no-canary`.

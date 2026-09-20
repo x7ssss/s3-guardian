@@ -67,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.5.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.6.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1488,6 +1488,95 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
         signal: ac.signal,
       });
       expect(code).toBe(0);
+    });
+  });
+
+  describe("Autonomous Circuit Breakers and Mutation Ceilings (v1.6.0)", () => {
+    it("apply rejects invalid --max-deletion-percent with code 2", async () => {
+      const tempFile = path.join(os.tmpdir(), `test-plan-invalid-pct-${Date.now()}.json`);
+      const plan: Plan = {
+        schemaVersion: "1.2",
+        generatedAt: new Date().toISOString(),
+        bucket: "pct-bucket",
+        endpoint: null,
+        olderThanDays: 7,
+        totalZombieUploads: 1,
+        totalStrandedBytes: 1000,
+        estimatedMonthlyWasteUSD: 0,
+        uploads: [
+          {
+            key: "test.bin",
+            uploadId: "uid-pct",
+            initiated: new Date(Date.now() - 10 * 86400000).toISOString(),
+            partsCount: 1,
+            bytes: 1000,
+            storageClass: "STANDARD",
+            lifecycleStatus: "UNPROTECTED",
+          },
+        ],
+      };
+      await writePlanFile(tempFile, plan);
+      try {
+        const code = await main(
+          ["apply", "--plan", tempFile, "--confirm", "--max-deletion-percent", "-5"],
+          captureIO
+        );
+        expect(code).toBe(2);
+        expect(stderrLogs.join("\n")).toContain("Error: --max-deletion-percent must be a positive number.");
+      } finally {
+        await fs.unlink(tempFile).catch(() => {});
+      }
+    });
+
+    it("apply blocks execution when mutation ceiling is exceeded and succeeds with --bypass-mutation-ceiling", async () => {
+      const tempFile = path.join(os.tmpdir(), `test-plan-ceiling-${Date.now()}.json`);
+      // 1001 uploads exceeds 1000 fallback ceiling
+      const uploads = Array.from({ length: 1001 }, (_, i) => ({
+        key: `file-${i}.bin`,
+        uploadId: `uid-${i}`,
+        initiated: new Date(Date.now() - 10 * 86400000).toISOString(),
+        partsCount: 1,
+        bytes: 100,
+        storageClass: "STANDARD" as const,
+        lifecycleStatus: "UNPROTECTED" as const,
+      }));
+      const plan: Plan = {
+        schemaVersion: "1.2",
+        generatedAt: new Date().toISOString(),
+        bucket: "ceiling-bucket",
+        endpoint: null,
+        olderThanDays: 7,
+        totalZombieUploads: 1001,
+        totalStrandedBytes: 100100,
+        estimatedMonthlyWasteUSD: 0,
+        uploads,
+      };
+      await writePlanFile(tempFile, plan);
+      s3Mock.on(AbortMultipartUploadCommand).resolves({});
+
+      try {
+        // Run without bypass -> should fail with code 1 (POLICY_VIOLATION)
+        const failCode = await main(
+          ["apply", "--plan", tempFile, "--confirm"],
+          captureIO
+        );
+        expect(failCode).toBe(1);
+        expect(stderrLogs.join("\n")).toContain("exceed absolute safety fallback ceiling");
+
+        stderrLogs = [];
+        stdoutLogs = [];
+
+        // Run with bypass and --no-canary -> should succeed with code 0
+        const successCode = await main(
+          ["apply", "--plan", tempFile, "--confirm", "--bypass-mutation-ceiling", "--no-canary"],
+          captureIO
+        );
+        expect(successCode).toBe(0);
+        expect(stdoutLogs.join("\n")).toContain("Successfully aborted: 1001");
+        expect(stdoutLogs.join("\n")).toContain("Circuit Breaker:      CLOSED");
+      } finally {
+        await fs.unlink(tempFile).catch(() => {});
+      }
     });
   });
 });

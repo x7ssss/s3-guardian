@@ -60,7 +60,7 @@ import { launchDashboard } from "./tui/index.js";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
 
-const VERSION = "1.5.0";
+const VERSION = "1.6.0";
 
 
 const HELP_TEXT = `
@@ -121,6 +121,9 @@ OPTIONS:
   --plan <file>                Plan file to apply
   --confirm                    Explicit confirmation required to execute apply deletions
   --bypass-governance          Bypass S3 Object Lock GOVERNANCE mode retention for version purges
+  --bypass-mutation-ceiling    Bypass relative bucket mutation ceiling safety check (default <= 5%)
+  --no-canary                  Skip pre-flight canary verification probe
+  --max-deletion-percent <pct> Custom relative mutation ceiling percentage (e.g. 10 for 10%, default: 5)
   --acknowledge-replication-divergence Acknowledge replica divergence on buckets with active replication
   --allow-active-churn         Allow deletion of uploads or versions modified within 24 hours
   --provider <name>            Target S3 provider: aws, r2, wasabi, b2, minio, ceph (autodetected if omitted)
@@ -671,6 +674,9 @@ export async function main(
         plan: { type: "string" },
         confirm: { type: "boolean", default: false },
         "bypass-governance": { type: "boolean", default: false },
+        "bypass-mutation-ceiling": { type: "boolean", default: false },
+        "no-canary": { type: "boolean", default: false },
+        "max-deletion-percent": { type: "string" },
         "acknowledge-replication-divergence": { type: "boolean", default: false },
         "allow-active-churn": { type: "boolean", default: false },
         provider: { type: "string" },
@@ -2261,6 +2267,17 @@ export async function main(
         return EXIT_CODES.ARG_ERROR;
       }
 
+      const maxDeletionPercentStr = getString(values["max-deletion-percent"]);
+      let maxDeletionPercent: number | undefined;
+      if (maxDeletionPercentStr !== undefined) {
+        const parsedPercent = parseFloat(maxDeletionPercentStr);
+        if (isNaN(parsedPercent) || parsedPercent <= 0) {
+          error("Error: --max-deletion-percent must be a positive number.");
+          return EXIT_CODES.ARG_ERROR;
+        }
+        maxDeletionPercent = parsedPercent > 1 ? parsedPercent / 100 : parsedPercent;
+      }
+
       log(`🚀 Reading and validating plan file: ${planFile}...`);
       let plan: Plan;
       try {
@@ -2309,6 +2326,8 @@ export async function main(
       const bypassGov = values["bypass-governance"] === true;
       const ackRepl = values["acknowledge-replication-divergence"] === true;
       const allowChurn = values["allow-active-churn"] === true;
+      const bypassMutationCeiling = values["bypass-mutation-ceiling"] === true;
+      const noCanary = values["no-canary"] === true;
 
       const blastRadius = await assessBucketBlastRadius(client, plan.bucket, {
         targets: blastRadiusTargets,
@@ -2361,23 +2380,33 @@ export async function main(
       // 1. Execute multipart upload aborts
       if (hasUploads) {
         log(`Executing abort operations for bucket '${plan.bucket}' (${plan.uploads.length} upload(s))...`);
-        const abortResult = await executeAbortPlan(client, plan, {
-          confirm: true,
-          provider: effectiveProvider,
-          forceWasabiEarlyDelete,
-          onProgress: (completed, total, item, status, correlation) => {
-            const trace = correlation?.requestId
-              ? ` [x-amz-request-id: ${correlation.requestId}]`
-              : "";
-            if (status === "SKIPPED_ALREADY_ABORTED") {
-              log(`  [${completed}/${total}] Skipped '${item.key}' (UploadId: ${item.uploadId}) — already aborted or completed${trace}`);
-            } else if (status === "FAILED") {
-              log(`  [${completed}/${total}] Failed '${item.key}' (UploadId: ${item.uploadId})${trace}`);
-            } else {
-              log(`  [${completed}/${total}] Aborted '${item.key}' (UploadId: ${item.uploadId})${trace}`);
-            }
-          },
-        });
+        let abortResult;
+        try {
+          abortResult = await executeAbortPlan(client, plan, {
+            confirm: true,
+            provider: effectiveProvider,
+            forceWasabiEarlyDelete,
+            bypassMutationCeiling,
+            skipCanary: noCanary,
+            maxDeletionPercent,
+            onProgress: (completed, total, item, status, correlation) => {
+              const trace = correlation?.requestId
+                ? ` [x-amz-request-id: ${correlation.requestId}]`
+                : "";
+              if (status === "SKIPPED_ALREADY_ABORTED") {
+                log(`  [${completed}/${total}] Skipped '${item.key}' (UploadId: ${item.uploadId}) — already aborted or completed${trace}`);
+              } else if (status === "FAILED") {
+                log(`  [${completed}/${total}] Failed '${item.key}' (UploadId: ${item.uploadId})${trace}`);
+              } else {
+                log(`  [${completed}/${total}] Aborted '${item.key}' (UploadId: ${item.uploadId})${trace}`);
+              }
+            },
+          });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`\n❌ Execution error: ${msg}`);
+          return EXIT_CODES.POLICY_VIOLATION;
+        }
 
         log("\nMultipart Upload cleanup summary:");
         log(`  Total Targeted:       ${abortResult.total}`);
@@ -2387,6 +2416,13 @@ export async function main(
         }
         log(`  Failed:               ${abortResult.failed}`);
         log(`  Storage Freed:        ${formatBytes(abortResult.bytesFreed)}`);
+        if (abortResult.circuitBreaker) {
+          const cb = abortResult.circuitBreaker;
+          log(`  Circuit Breaker:      ${cb.getState()} (concurrency: ${cb.getConcurrency()}, errors: ${cb.getErrorRatePercent()}%)`);
+          if (cb.getState() === "OPEN") {
+            hadErrors = true;
+          }
+        }
 
         if (abortResult.errors.length > 0) {
           hadErrors = true;
@@ -2410,28 +2446,45 @@ export async function main(
           blastRadius.objectLock?.mode === "GOVERNANCE" && bypassGov
         );
 
-        const versionResult = await executeVersionDeletion(
-          client,
-          plan.bucket,
-          entries,
-          {
-            confirm: true,
-            bypassGovernance: passBypassGov,
-            provider: effectiveProvider,
-            forceWasabiEarlyDelete,
-            onProgress: (deleted, total, correlation) => {
-              const trace = correlation?.requestId
-                ? ` [x-amz-request-id: ${correlation.requestId}]`
-                : "";
-              log(`  [${deleted}/${total}] Deleted object versions...${trace}`);
-            },
-          }
-        );
+        let versionResult;
+        try {
+          versionResult = await executeVersionDeletion(
+            client,
+            plan.bucket,
+            entries,
+            {
+              confirm: true,
+              bypassGovernance: passBypassGov,
+              provider: effectiveProvider,
+              forceWasabiEarlyDelete,
+              bypassMutationCeiling,
+              skipCanary: noCanary,
+              maxDeletionPercent,
+              onProgress: (deleted, total, correlation) => {
+                const trace = correlation?.requestId
+                  ? ` [x-amz-request-id: ${correlation.requestId}]`
+                  : "";
+                log(`  [${deleted}/${total}] Deleted object versions...${trace}`);
+              },
+            }
+          );
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`\n❌ Execution error: ${msg}`);
+          return EXIT_CODES.POLICY_VIOLATION;
+        }
 
         log("\nVersion Deletion summary:");
         log(`  Total Targeted:       ${versionResult.total}`);
         log(`  Successfully deleted: ${versionResult.deleted}`);
         log(`  Failed:               ${versionResult.failed}`);
+        if (versionResult.circuitBreaker) {
+          const cb = versionResult.circuitBreaker;
+          log(`  Circuit Breaker:      ${cb.getState()} (concurrency: ${cb.getConcurrency()}, errors: ${cb.getErrorRatePercent()}%)`);
+          if (cb.getState() === "OPEN") {
+            hadErrors = true;
+          }
+        }
 
         if (versionResult.errors.length > 0) {
           hadErrors = true;

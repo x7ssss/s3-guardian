@@ -40,6 +40,8 @@ describe("Versioning Executor (executeVersionDeletion)", () => {
 
     const result = await executeVersionDeletion(client, "my-bucket", entries, {
       confirm: true,
+      bypassMutationCeiling: true,
+      skipCanary: true,
     });
 
     expect(result.total).toBe(2500);

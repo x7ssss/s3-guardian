@@ -6,6 +6,9 @@ import {
 } from "@aws-sdk/client-s3";
 import { withRetry, isSlowDownError, RetryOptions } from "../utils/retry.js";
 import { S3Provider } from "../providers/detector.js";
+import { evaluateMutationCeiling } from "../safety/mutation-budget.js";
+import { executeCanaryGate, CanaryVerificationError } from "../safety/canary.js";
+import { CircuitBreaker } from "../circuit/breaker.js";
 
 export interface TargetVersionIdentifier {
   Key: string;
@@ -28,6 +31,11 @@ export interface VersionExecutorOptions {
   now?: Date;
   batchSize?: number;
   retryOptions?: RetryOptions;
+  estimatedInventory?: number;
+  bypassMutationCeiling?: boolean;
+  maxDeletionPercent?: number;
+  skipCanary?: boolean;
+  circuitBreaker?: CircuitBreaker;
   onProgress?: (
     deleted: number,
     total: number,
@@ -48,6 +56,7 @@ export interface VersionExecutionResult {
   failed: number;
   errors: VersionDeletionFailure[];
   correlations?: CloudTrailCorrelationBatch[];
+  circuitBreaker?: CircuitBreaker;
 }
 
 const MAX_BATCH_SIZE = 1000;
@@ -84,7 +93,25 @@ export async function executeVersionDeletion(
     );
   }
 
-  // Wasabi 90-Day Retention Guard
+  // 1. Relative Mutation Ceiling (Invariant 5)
+  const ceiling = evaluateMutationCeiling(
+    entries.length,
+    options.estimatedInventory,
+    {
+      maxPercent: options.maxDeletionPercent,
+      bypass: options.bypassMutationCeiling,
+    }
+  );
+  if (!ceiling.allowed) {
+    throw new Error(`Safety check failed: ${ceiling.reason}`);
+  }
+
+  // 2. Circuit Breaker initialization
+  const breaker =
+    options.circuitBreaker ??
+    new CircuitBreaker(bucket, "DeleteObjects");
+
+  // 3. Wasabi 90-Day Retention Guard
   if (options.provider === "wasabi" && !options.forceWasabiEarlyDelete) {
     const now = options.now ?? new Date();
     const nowTime = now.getTime();
@@ -105,17 +132,94 @@ export async function executeVersionDeletion(
     }
   }
 
+  let totalDeleted = 0;
+  const allErrors: VersionDeletionFailure[] = [];
+  const correlations: CloudTrailCorrelationBatch[] = [];
+  let itemsToExecute = entries;
+
+  // 4. Canary Gate Verification (Invariant 6)
+  if (!options.skipCanary && entries.length > 0) {
+    try {
+      const canaryResult = await executeCanaryGate(client, bucket, entries, breaker, {
+        bypassGovernance: options.bypassGovernance,
+        retryOptions: options.retryOptions,
+      });
+      totalDeleted += canaryResult.deletedCount;
+      if (canaryResult.requestIds.length > 0) {
+        correlations.push({
+          requestId: canaryResult.requestIds[0],
+          batchSize: canaryResult.canaryTargetCount,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      options.onProgress?.(totalDeleted, entries.length, {
+        requestId: canaryResult.requestIds[0],
+      });
+      itemsToExecute = canaryResult.remainingTargets;
+    } catch (err: unknown) {
+      if (err instanceof CanaryVerificationError) {
+        if (err.outcomes && err.outcomes.length > 0) {
+          for (const outcome of err.outcomes) {
+            if (outcome.status === "DELETED") {
+              totalDeleted++;
+            }
+          }
+        }
+        if (err.errors && err.errors.length > 0) {
+          allErrors.push(...err.errors);
+        } else {
+          allErrors.push({
+            Key: entries[0]?.Key ?? "",
+            VersionId: entries[0]?.VersionId ?? "",
+            Code: "CanaryVerificationFailed",
+            Message: err.message,
+          });
+        }
+        // Account for any remaining targets if not all targets were in canary
+        const processedIdentifiers = new Set(
+          (err.outcomes ?? []).map((o) => `${o.key}::${o.versionId}`)
+        );
+        for (const item of entries) {
+          const id = `${item.Key}::${item.VersionId}`;
+          if (!processedIdentifiers.has(id)) {
+            allErrors.push({
+              Key: item.Key,
+              VersionId: item.VersionId,
+              Code: "CanaryVerificationFailed",
+              Message: `Aborted due to canary failure: ${err.message}`,
+            });
+          }
+        }
+        return {
+          total: entries.length,
+          deleted: totalDeleted,
+          failed: allErrors.length,
+          errors: allErrors,
+          correlations,
+          circuitBreaker: breaker,
+        };
+      }
+      throw err;
+    }
+  }
+
   const batchSize = Math.min(
     MAX_BATCH_SIZE,
     Math.max(1, options.batchSize ?? MAX_BATCH_SIZE)
   );
 
-  let totalDeleted = 0;
-  const allErrors: VersionDeletionFailure[] = [];
-  const correlations: CloudTrailCorrelationBatch[] = [];
+  for (let i = 0; i < itemsToExecute.length; i += batchSize) {
+    if (!breaker.canExecute()) {
+      allErrors.push({
+        Key: itemsToExecute[i]?.Key ?? "",
+        VersionId: itemsToExecute[i]?.VersionId ?? "",
+        Code: "CircuitBreakerOpen",
+        Message: `Circuit breaker tripped to OPEN: ${breaker.getTripReason()}`,
+      });
+      break;
+    }
 
-  for (let i = 0; i < entries.length; i += batchSize) {
-    const chunk = entries.slice(i, i + batchSize);
+    const chunk = itemsToExecute.slice(i, i + batchSize);
     let itemsToProcess: TargetVersionIdentifier[] = [...chunk];
     let attempt = 0;
     const maxRetries = options.retryOptions?.maxRetries ?? 3;
@@ -151,6 +255,7 @@ export async function executeVersionDeletion(
       });
 
       const batchErrors = response.Errors ?? [];
+      breaker.recordBatchResult(s3Objects.length, batchErrors);
 
       if (batchErrors.length === 0) {
         // Entire sub-batch succeeded
@@ -188,6 +293,10 @@ export async function executeVersionDeletion(
         extendedRequestId,
       });
 
+      if (breaker.getState() === "OPEN") {
+        break;
+      }
+
       if (transientItems.length > 0 && attempt <= maxRetries) {
         itemsToProcess = transientItems;
         // Jittered backoff before retrying transient items
@@ -197,6 +306,10 @@ export async function executeVersionDeletion(
         break;
       }
     }
+
+    if (breaker.getState() === "OPEN") {
+      break;
+    }
   }
 
   return {
@@ -205,5 +318,6 @@ export async function executeVersionDeletion(
     failed: allErrors.length,
     errors: allErrors,
     correlations,
+    circuitBreaker: breaker,
   };
 }

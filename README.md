@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.5.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.6.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -35,8 +35,17 @@ Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned 
                                        │           • Tag Exclusions & Active Churn (<24h)
                                        ▼
                                ┌──────────────┐
-                               │   EXECUTOR   │ ── Bounded Concurrency (max 10)
-                               └───────┬──────┘    • Quiet Batch Deletion + Error Inspection
+                               │ CANARY GATE  │ ── 10-Target Pre-Flight Probe:
+                               │  VERIFIER    │    • Isolated Deletion + HeadObject Verification
+                               └───────┬──────┘
+                                       │
+                                       ▼
+                               ┌──────────────┐
+                               │   EXECUTOR   │ ── Autonomous Circuit Breaker (CLOSED/OPEN/HALF_OPEN)
+                               └───────┬──────┘    • Zero-Allocation Float32Array Error Tracking
+                                       │           • Dynamic 503 Concurrency Halving & Burst Trip
+                                       │           • 403 Hard Cliff Trip & 400 BadDigest Quarantine
+                                       │           • Bounded Concurrency & Quiet Batch Inspection
                                        │           • Forensic CloudTrail Correlation Tracing
                                        ▼
                    ┌───────────────────────────────────────┐
@@ -62,6 +71,9 @@ Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned 
 ## Core Enterprise Invariants
 
 - **Zero Third-Party Runtime Dependencies:** Runs purely on Node.js 20+ built-ins (`node:crypto`, `node:readline`, `node:util`) and official modular AWS SDK clients (`@aws-sdk/client-s3`, `@aws-sdk/client-sts`, `@aws-sdk/client-organizations`).
+- **Autonomous Circuit Breaker & Zero-Allocation Ring Buffer:** Scoped per (bucket, operation). Tracks error rates in $O(1)$ time with zero GC churn using a pre-allocated `Float32Array` ring buffer. Trips to `OPEN` on 3 consecutive 403s, halves concurrency on 503s (burst trips on $\ge 3$ in 5s or $>10\%$ moving error rate), and quarantines on 400 BadDigest.
+- **Pre-Flight Canary Verification Gate:** Runs isolated deletions on up to 10 oldest targets with `HeadObject` probe verification before admitting the remaining fleet batch loop.
+- **Relative Mutation Ceiling:** Caps autonomous deletions to $\le 5\%$ of total bucket inventory (or 1,000 objects absolute fallback) to prevent catastrophic accidental wipeouts.
 - **Destructive Operations Safety Gate:** `apply` strictly requires an immutable, cryptographically verified `plan.json` file and the explicit `--confirm` flag.
 - **Pre-Flight Blast Radius Engine:** Simulates mutation safety before making any destructive API calls:
   - Blocks deletions under Object Lock `COMPLIANCE` mode.
@@ -445,6 +457,9 @@ s3-guardian dashboard --provider minio --endpoint http://localhost:9000
 | `--plan <file>` | string | — | Path to plan file to execute |
 | `--confirm` | flag | `false` | Explicit confirmation required for destructive apply |
 | `--bypass-governance` | flag | `false` | Bypass S3 Object Lock GOVERNANCE mode retention |
+| `--bypass-mutation-ceiling` | flag | `false` | Bypass relative bucket mutation ceiling safety check (default <= 5%) |
+| `--no-canary` | flag | `false` | Skip pre-flight canary verification probe |
+| `--max-deletion-percent <pct>` | number | `5` | Custom relative mutation ceiling percentage (e.g. 10 for 10%) |
 | `--acknowledge-replication-divergence` | flag | `false` | Acknowledge replica divergence on CRR/SRR replicated buckets |
 | `--allow-active-churn` | flag | `false` | Allow deletion of uploads or versions modified within 24 hours |
 | `--all-buckets` | flag | `false` | Fleet mode: scan or remediate across all account buckets |
@@ -469,7 +484,7 @@ s3-guardian dashboard --provider minio --endpoint http://localhost:9000
 | Exit Code | Classification | Description |
 | :--- | :--- | :--- |
 | `0` | `SUCCESS` | Scan clean, plan generated, apply completed, or policies satisfied |
-| `1` | `POLICY_VIOLATION` | Safety gate tripped (Object Lock, churn, tampered plan, Wasabi retention) or CI/CD budget breached |
+| `1` | `POLICY_VIOLATION` | Safety gate tripped (Object Lock, churn, tampered plan, Wasabi retention, mutation ceiling) or CI/CD budget breached |
 | `2` | `ARG_ERROR` | Missing required parameters, invalid flags, or syntax error |
 | `3` | `DISCOVERY_AUTH_ERROR` | AWS Organizations discovery failure, STS AssumeRole denied, or missing credentials |
 
@@ -481,6 +496,11 @@ s3-guardian dashboard --provider minio --endpoint http://localhost:9000
 | :--- | :--- | :--- | :--- |
 | **Object Lock COMPLIANCE** | `CRITICAL_BLOCKED` | Hard abort before sending API calls. Deletions strictly forbidden. | None (Immutable) |
 | **Object Lock GOVERNANCE** | `HIGH` | Verified via `GetObjectLockConfiguration`. Header withheld unless verified. | `--bypass-governance` |
+| **Proportional Mutation Ceiling** | `POLICY_VIOLATION` | Caps deletions to <= 5% of bucket inventory (or 1,000 objects fallback). | `--bypass-mutation-ceiling` |
+| **Canary Verification Gate Failure** | `POLICY_VIOLATION` | 10 oldest targets pre-flight probed via HeadObject before batch execution. | `--no-canary` |
+| **Circuit Breaker (403 Cliff)** | `OPEN` | Trips immediately after 3 consecutive AccessDenied errors to prevent IAM hammering. | Fix IAM permissions |
+| **Circuit Breaker (503 Throttling)** | `ADAPTIVE` | Halves concurrency; trips to OPEN on burst (>= 3 in 5s) or >10% sustained error rate. | Automatic backoff |
+| **Circuit Breaker (400 BadDigest)** | `QUARANTINE` | Immediate trip to OPEN and bucket quarantine on checksum mismatch / integrity corruption. | Investigate corruption |
 | **Replication Divergence** | `HIGH` | Detects CRR/SRR rules via `GetBucketReplication`. Prevents replica drift. | `--acknowledge-replication-divergence` |
 | **Protected State Prefixes** | `CRITICAL_BLOCKED` | Hard-blocks `checkpoints/`, `_wal/`, `iceberg/`, `manifests/`, `state/`. | None (Immutable) |
 | **Protected Bucket Tags** | `CRITICAL_BLOCKED` | Excludes `s3-guardian:ignore=true`, `Backup=true`, `Protection=locked`. | Remove tag in AWS |

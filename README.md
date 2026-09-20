@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.8.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.9.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -504,10 +504,72 @@ s3-guardian rehydrate my-bucket --older-than 2026-08-01T00:00:00Z --json
 
 ---
 
+## Declarative Storage Policy Engine & Precedence Hierarchy (v1.9.0)
+
+Define centralized, declarative storage lifecycle rules using native JSON or the zero-dependency Guardian YAML subset:
+
+```yaml
+schemaVersion: "1"
+policyId: enterprise-standard-lifecycle
+scope:
+  level: BUCKET_TAG
+  priority: 100
+defaults:
+  action: AUTO_REMEDIATE
+  mpuAbortDays: 7d
+rules:
+  - id: cleanup-temp-uploads
+    match:
+      object:
+        prefix: tmp/
+    expirationDays: 7d
+  - id: archive-production-data
+    match:
+      object:
+        prefix: data/
+        tags:
+          RetentionTier: Archive
+        minSizeKb: 128KiB
+    transitions:
+      - days: 30d
+        storageClass: STANDARD_IA
+      - days: 90d
+        storageClass: GLACIER
+    expirationDays: 365d
+```
+
+### Key Capabilities:
+- **Zero-Dependency YAML/JSON Subset Parser:** Line tokenization, indentation tracking (tabs strictly rejected), human durations (`7d`, `24h`), and human sizes (`128KiB`, `1MiB`).
+- **Precedence Hierarchy:** `OBJECT_TAG (40)` > `BUCKET_TAG (30)` > `ACCOUNT (25)` > `OU (20)` > `GLOBAL (10)`. Leaf-level property merging with provenance tracking.
+- **Fail-Safe Action Mode:** Most restrictive wins: `MONITOR_ONLY (1)` < `PLAN_ONLY (2)` < `AUTO_REMEDIATE (3)`.
+- **Static FinOps Safety Guards:** Enforces 128 KiB minimum transition size floor, MPU churn guard ($\ge 7$d), tag/MPU contradiction separation, and Glacier ($\ge 90$d) / Deep Archive ($\ge 180$d) early deletion penalties.
+
+### CLI Usage Examples:
+
+```bash
+# Statically validate policy syntax and FinOps safety guards
+s3-guardian policy validate policy.yaml
+
+# Generate live plan preview with leaf merge and provenance tracking
+s3-guardian policy plan my-bucket --policy policy.yaml --out plan.json
+
+# Apply compiled lifecycle configuration to AWS S3 with UndoManifest
+s3-guardian policy apply my-bucket --policy policy.yaml --confirm
+
+# Audit declarative policy compliance across fleet buckets
+s3-guardian scan --all-buckets --policy policy.yaml
+```
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `policy validate <file>` | command | — | Statically validate JSON or Guardian YAML subset policy document |
+| `policy plan <bucket>` | command | — | Evaluate bucket tags, resolve precedence, and output preview |
+| `policy apply <bucket>` | command | — | Apply compiled configuration and write UndoManifest (requires `--confirm`) |
+| `--policy <file>` | string | — | Path to declarative storage policy file (JSON or YAML subset) |
 | `rollback <manifest>` | command | — | Invert mutation from UndoManifest with RFC 8785 state verification |
 | `certificate <cert>` | command | — | Format and display SOC 2 / ISO 27001 immutable deletion certificate |
 | `rehydrate <bucket>` | command | — | Safely pop Delete Markers to un-delete and restore hidden data versions |

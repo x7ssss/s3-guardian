@@ -52,7 +52,13 @@ import {
   generateTerraformTransitionRemediation,
   generateCloudFormationTransitionRemediation,
 } from "./remediation/iac.js";
-import { ListBucketsCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3";
+import {
+  ListBucketsCommand,
+  GetBucketLocationCommand,
+  PutBucketLifecycleConfigurationCommand,
+  GetBucketLifecycleConfigurationCommand,
+  GetBucketTaggingCommand,
+} from "@aws-sdk/client-s3";
 import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
 import { matchesExcludePattern } from "./fleet/scanner.js";
 import { detectProvider, getProviderDisplayName, S3Provider } from "./providers/index.js";
@@ -69,12 +75,27 @@ import {
   RemoteStateDriftError,
   rehydrateSoftDeletes,
   DeletionCertificate,
+  captureLifecyclePreState,
+  captureTaggingPreState,
+  createUndoManifest,
 } from "./rollback/index.js";
+import {
+  canonicalizeJson,
+  computeSha256Hex,
+} from "./planner/jcs.js";
+import {
+  parsePolicyDocument,
+  validatePolicy,
+  resolveBucketPolicy,
+  compileToLifecycleConfiguration,
+  BucketMetadata,
+  GuardianPolicy,
+} from "./policy/index.js";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 
-const VERSION = "1.8.0";
+const VERSION = "1.9.0";
 
 
 const HELP_TEXT = `
@@ -108,6 +129,9 @@ USAGE:
   s3-guardian rollback <manifest-path> [options]
   s3-guardian certificate <cert-path> [options]
   s3-guardian rehydrate <bucket> [options]
+  s3-guardian policy validate <file> [options]
+  s3-guardian policy plan <bucket> --policy <file> [options]
+  s3-guardian policy apply <bucket> --policy <file> --confirm [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -128,8 +152,12 @@ COMMANDS:
   rollback <manifest-path> Invert mutation from UndoManifest with cryptographic state verification
   certificate <cert-path> Format and display SOC 2 / ISO 27001 immutable deletion certificate
   rehydrate <bucket>      Safely pop Delete Markers to un-delete and restore hidden object versions
+  policy validate <file>  Statically validate JSON or Guardian YAML subset policy documents
+  policy plan <bucket>    Evaluate bucket tags, resolve precedence, and output preview
+  policy apply <bucket>   Apply compiled configuration and write UndoManifest (requires --confirm)
 
 OPTIONS:
+  --policy <file>              Declarative storage policy file (JSON/YAML subset)
   --state-dir <path>           Local state directory for audit.jsonl and snapshots (default: .s3-guardian)
   --s3-mirror <bucket>         Target S3 bucket to mirror compressed audit snapshots
   --force                      Force rollback execution even if remote state has diverged
@@ -680,6 +708,50 @@ function renderDriftTable(
   );
 }
 
+function checkFleetPolicyCompliance(
+  fleetResult: FleetScanResult,
+  policyDoc: GuardianPolicy
+): { violations: { rule: "FAIL_ON_UNPROTECTED"; message: string }[]; compliantCount: number } {
+  const violations: { rule: "FAIL_ON_UNPROTECTED"; message: string }[] = [];
+  let compliantCount = 0;
+
+  for (const b of fleetResult.bucketResults) {
+    if (b.status !== "AUDITED") continue;
+
+    const bMeta: BucketMetadata = {
+      name: b.bucket,
+      region: b.region ?? US_EAST_1,
+      tags: {},
+    };
+
+    const resolved = resolveBucketPolicy(bMeta, [policyDoc]);
+    if (resolved.effectiveRules.length === 0) {
+      compliantCount++;
+      continue;
+    }
+
+    const requiresMpu = resolved.effectiveRules.some((r) => r.mpuAbortDays !== undefined);
+    const hasLifecycle = Boolean(b.lifecycleAudit?.bucketHasLifecyclePolicy);
+    const hasCoveringMpu = Boolean(b.lifecycleAudit?.hasCoveringRule);
+
+    if (!hasLifecycle) {
+      violations.push({
+        rule: "FAIL_ON_UNPROTECTED",
+        message: `Bucket '${b.bucket}' lacks lifecycle configuration required by policy '${policyDoc.policyId}'.`,
+      });
+    } else if (requiresMpu && !hasCoveringMpu) {
+      violations.push({
+        rule: "FAIL_ON_UNPROTECTED",
+        message: `Bucket '${b.bucket}' lacks active MPU abort rule required by policy '${policyDoc.policyId}'.`,
+      });
+    } else {
+      compliantCount++;
+    }
+  }
+
+  return { violations, compliantCount };
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function main(
@@ -748,6 +820,7 @@ export async function main(
         "s3-mirror": { type: "string" },
         force: { type: "boolean", default: false },
         "dry-run": { type: "boolean", default: false },
+        policy: { type: "string" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -831,6 +904,7 @@ export async function main(
   const webhookType = getString(values["webhook-type"]) as WebhookType | undefined;
   const notifyAlways = values["notify-always"] === true;
   const checkpoint = getString(values.checkpoint);
+  const policyFile = getString(values.policy);
 
   let maxWasteUSD: number | undefined;
   const maxWasteStr = getString(values["max-waste-usd"]);
@@ -1153,6 +1227,35 @@ export async function main(
 
         const policyResult = evaluatePolicy(fleetResult, policyOptions);
 
+        let fleetPolicyDoc: GuardianPolicy | undefined = undefined;
+        let fleetPolicyCompliance:
+          | { violations: { rule: "FAIL_ON_UNPROTECTED"; message: string }[]; compliantCount: number }
+          | undefined = undefined;
+
+        if (policyFile) {
+          try {
+            const pContent = await fsPromises.readFile(policyFile, "utf8");
+            fleetPolicyDoc = parsePolicyDocument(pContent);
+            const pVal = validatePolicy(fleetPolicyDoc);
+            if (!pVal.valid) {
+              error(`\n❌ Policy validation failed for '${policyFile}':`);
+              for (const e of pVal.errors) {
+                error(`  - ${e}`);
+              }
+              return EXIT_CODES.POLICY_VIOLATION;
+            }
+            fleetPolicyCompliance = checkFleetPolicyCompliance(fleetResult, fleetPolicyDoc);
+            policyResult.violations.push(...fleetPolicyCompliance.violations);
+            if (fleetPolicyCompliance.violations.length > 0) {
+              policyResult.exitCode = EXIT_CODES.POLICY_VIOLATION;
+            }
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Declarative policy error: ${msg}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+        }
+
         if (webhookUrl) {
           await dispatchNotification(
             {
@@ -1200,6 +1303,13 @@ export async function main(
         }
         log(``);
         renderFleetTable(fleetResult, log);
+
+        if (fleetPolicyDoc && fleetPolicyCompliance) {
+          log(`\n📋 Declarative Policy Compliance (${fleetPolicyDoc.policyId}):`);
+          log(`  Audited Buckets:        ${fleetResult.bucketsAudited}`);
+          log(`  Compliant Buckets:      ${fleetPolicyCompliance.compliantCount}`);
+          log(`  Non-Compliant Buckets:  ${fleetPolicyCompliance.violations.length}`);
+        }
 
         if (auditTransitions) {
           const bucketsWithTraps = fleetResult.bucketResults.filter(
@@ -3045,6 +3155,394 @@ export async function main(
         const msg = err instanceof Error ? err.message : String(err);
         error(`\n❌ Rehydration error: ${msg}`);
         return EXIT_CODES.POLICY_VIOLATION;
+      }
+    }
+
+    // ── POLICY (v1.9.0) ───────────────────────────────────────────────────────
+    case "policy": {
+      const sub = positionals[1]?.toLowerCase();
+      if (!sub) {
+        error("Error: Subcommand required for 'policy'. Usage: s3-guardian policy <validate|plan|apply> [options]");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      switch (sub) {
+        case "validate": {
+          const targetFile = positionals[2] || policyFile;
+          if (!targetFile) {
+            error("Error: Policy file path is required. Usage: s3-guardian policy validate <file>");
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          let content: string;
+          try {
+            content = await fsPromises.readFile(targetFile, "utf8");
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Failed to read policy file '${targetFile}': ${msg}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          let policyDoc: GuardianPolicy;
+          try {
+            policyDoc = parsePolicyDocument(content);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Policy syntax/parse error in '${targetFile}':\n  ${msg}`);
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          const validation = validatePolicy(policyDoc);
+          if (!validation.valid) {
+            error(`\n❌ Policy validation failed for '${targetFile}':`);
+            for (const err of validation.errors) {
+              error(`  - ${err}`);
+            }
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          if (isJson) {
+            log(
+              JSON.stringify(
+                {
+                  valid: true,
+                  policyId: policyDoc.policyId,
+                  scope: policyDoc.scope,
+                  rulesCount: policyDoc.rules.length,
+                  warnings: validation.warnings,
+                },
+                null,
+                2
+              )
+            );
+            return EXIT_CODES.SUCCESS;
+          }
+
+          log(`\n✅ Policy '${policyDoc.policyId}' is valid.`);
+          log(`  Schema Version: ${policyDoc.schemaVersion}`);
+          log(`  Scope:          ${policyDoc.scope.level}`);
+          log(`  Rules Defined:  ${policyDoc.rules.length}`);
+          if (validation.warnings.length > 0) {
+            log(`\n⚠️ Warnings:`);
+            for (const w of validation.warnings) {
+              log(`  - ${w}`);
+            }
+          }
+          return EXIT_CODES.SUCCESS;
+        }
+
+        case "plan": {
+          const targetBucket =
+            (typeof positionals[2] === "string" ? positionals[2] : undefined) ||
+            getString(values.bucket);
+          if (!targetBucket) {
+            error("Error: Bucket name is required. Usage: s3-guardian policy plan <bucket> --policy <file>");
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          const targetPolicyFile = policyFile || positionals[3];
+          if (!targetPolicyFile) {
+            error("Error: --policy <file> is required. Usage: s3-guardian policy plan <bucket> --policy <file>");
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          let content: string;
+          try {
+            content = await fsPromises.readFile(targetPolicyFile, "utf8");
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Failed to read policy file '${targetPolicyFile}': ${msg}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          let policyDoc: GuardianPolicy;
+          try {
+            policyDoc = parsePolicyDocument(content);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Policy syntax/parse error in '${targetPolicyFile}':\n  ${msg}`);
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          const validation = validatePolicy(policyDoc);
+          if (!validation.valid) {
+            error(`\n❌ Policy validation failed for '${targetPolicyFile}':`);
+            for (const err of validation.errors) {
+              error(`  - ${err}`);
+            }
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          const client = createS3Client(clientConfig);
+
+          let bucketRegion = region ?? US_EAST_1;
+          try {
+            const locRes = await client.send(
+              new GetBucketLocationCommand({ Bucket: targetBucket })
+            );
+            bucketRegion = normalizeBucketRegion(locRes.LocationConstraint);
+          } catch {
+            // fallback to client default region
+          }
+
+          const tagsRecord: Record<string, string> = {};
+          try {
+            const taggingState = await captureTaggingPreState(client, targetBucket);
+            if (taggingState.preState && Array.isArray((taggingState.preState as any).TagSet)) {
+              for (const t of (taggingState.preState as any).TagSet) {
+                if (t.Key) {
+                  tagsRecord[t.Key] = t.Value ?? "";
+                }
+              }
+            }
+          } catch {
+            // NoSuchTagSet or permission denied
+          }
+
+          const bucketMetadata: BucketMetadata = {
+            name: targetBucket,
+            region: bucketRegion,
+            tags: tagsRecord,
+          };
+
+          const resolved = resolveBucketPolicy(bucketMetadata, [policyDoc]);
+          const lifecycleInput = compileToLifecycleConfiguration(targetBucket, resolved);
+
+          const planOutput = {
+            bucket: targetBucket,
+            region: bucketRegion,
+            policyId: policyDoc.policyId,
+            scope: policyDoc.scope,
+            effectiveAction: resolved.action,
+            effectiveRules: resolved.effectiveRules,
+            provenance: resolved.provenance,
+            compiledLifecycleConfiguration: lifecycleInput.LifecycleConfiguration,
+          };
+
+          const outPath = getString(values.out);
+          if (outPath) {
+            await fsPromises.writeFile(
+              outPath,
+              JSON.stringify(planOutput, null, 2),
+              "utf8"
+            );
+            if (!isJson) {
+              log(`\n📝 Plan written to ${outPath}`);
+            }
+          }
+
+          if (isJson) {
+            log(JSON.stringify(planOutput, null, 2));
+            return EXIT_CODES.SUCCESS;
+          }
+
+          log(`\n📋 Declarative Policy Plan for '${targetBucket}' (Policy: ${policyDoc.policyId}):`);
+          log(`  Scope Level:            ${policyDoc.scope.level}`);
+          log(`  Effective Action Mode:  ${resolved.action}`);
+          log(`  Matching Rules Count:   ${resolved.effectiveRules.length}`);
+          log(`  Compiled AWS Rules:     ${lifecycleInput.LifecycleConfiguration?.Rules?.length ?? 0}`);
+
+          if (resolved.effectiveRules.length > 0) {
+            log(`\n  Effective Rules:`);
+            for (const r of resolved.effectiveRules) {
+              const details: string[] = [];
+              if (r.mpuAbortDays !== undefined) details.push(`AbortMPU: ${r.mpuAbortDays}d`);
+              if (r.expirationDays !== undefined) details.push(`Expire: ${r.expirationDays}d`);
+              if (r.noncurrentExpirationDays !== undefined) {
+                details.push(`NoncurrentExpire: ${r.noncurrentExpirationDays}d (retain ${r.retainVersions ?? 0} versions)`);
+              }
+              if (r.transitions && r.transitions.length > 0) {
+                details.push(
+                  `Transitions: [${r.transitions.map((t) => `${t.days}d -> ${t.storageClass}`).join(", ")}]`
+                );
+              }
+              log(`    • Rule [${r.id}] (Action: ${r.action}):`);
+              log(`        ${details.join(" | ") || "No explicit lifecycle actions"}`);
+            }
+          }
+
+          if (lifecycleInput.LifecycleConfiguration?.Rules?.length) {
+            log(`\n  Compiled AWS Lifecycle Rules:`);
+            for (const cr of lifecycleInput.LifecycleConfiguration.Rules) {
+              log(`    • [${cr.ID}] Status: ${cr.Status}`);
+            }
+          }
+          return EXIT_CODES.SUCCESS;
+        }
+
+        case "apply": {
+          if (!values.confirm) {
+            error("Error: '--confirm' is strictly required to execute policy apply.");
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          const targetBucket =
+            (typeof positionals[2] === "string" ? positionals[2] : undefined) ||
+            getString(values.bucket);
+          if (!targetBucket) {
+            error("Error: Bucket name is required. Usage: s3-guardian policy apply <bucket> --policy <file> --confirm");
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          const targetPolicyFile = policyFile || positionals[3];
+          if (!targetPolicyFile) {
+            error("Error: --policy <file> is required. Usage: s3-guardian policy apply <bucket> --policy <file> --confirm");
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          let content: string;
+          try {
+            content = await fsPromises.readFile(targetPolicyFile, "utf8");
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Failed to read policy file '${targetPolicyFile}': ${msg}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+
+          let policyDoc: GuardianPolicy;
+          try {
+            policyDoc = parsePolicyDocument(content);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Policy syntax/parse error in '${targetPolicyFile}':\n  ${msg}`);
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          const validation = validatePolicy(policyDoc);
+          if (!validation.valid) {
+            error(`\n❌ Policy validation failed for '${targetPolicyFile}':`);
+            for (const err of validation.errors) {
+              error(`  - ${err}`);
+            }
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          const client = createS3Client(clientConfig);
+
+          let bucketRegion = region ?? US_EAST_1;
+          try {
+            const locRes = await client.send(
+              new GetBucketLocationCommand({ Bucket: targetBucket })
+            );
+            bucketRegion = normalizeBucketRegion(locRes.LocationConstraint);
+          } catch {
+            // fallback
+          }
+
+          const tagsRecord: Record<string, string> = {};
+          try {
+            const taggingState = await captureTaggingPreState(client, targetBucket);
+            if (taggingState.preState && Array.isArray((taggingState.preState as any).TagSet)) {
+              for (const t of (taggingState.preState as any).TagSet) {
+                if (t.Key) {
+                  tagsRecord[t.Key] = t.Value ?? "";
+                }
+              }
+            }
+          } catch {
+            // Ignore
+          }
+
+          const bucketMetadata: BucketMetadata = {
+            name: targetBucket,
+            region: bucketRegion,
+            tags: tagsRecord,
+          };
+
+          const resolved = resolveBucketPolicy(bucketMetadata, [policyDoc]);
+          if (resolved.action === "MONITOR_ONLY") {
+            error(`\n❌ Policy execution blocked: Resolved action mode is MONITOR_ONLY for bucket '${targetBucket}'. Mutations are prohibited.`);
+            return EXIT_CODES.POLICY_VIOLATION;
+          }
+
+          const lifecycleInput = compileToLifecycleConfiguration(targetBucket, resolved);
+
+          // Capture pre-state for rollback
+          const preStateCapture = await captureLifecyclePreState(client, targetBucket);
+
+          // Execute mutation
+          const putRes = await client.send(
+            new PutBucketLifecycleConfigurationCommand(lifecycleInput)
+          );
+          const reqId = (putRes?.$metadata as any)?.requestId;
+
+          // Compute canonical plan hash
+          const planHash = computeSha256Hex(
+            canonicalizeJson(lifecycleInput.LifecycleConfiguration)
+          );
+
+          // Create UndoManifest
+          const undoResult = await createUndoManifest({
+            bucketName: targetBucket,
+            stateDir: getString(values["state-dir"]),
+            mutationType: "LIFECYCLE_CONFIGURATION",
+            preState: preStateCapture.preState,
+            postState: lifecycleInput.LifecycleConfiguration,
+            appliedPlanHash: planHash,
+            requestIds: reqId ? [reqId] : [],
+          });
+
+          // Log audit event
+          try {
+            const auditWriter = new AuditLogWriter({
+              stateDir: getString(values["state-dir"]),
+            });
+            await auditWriter.append(
+              createAuditEvent({
+                eventType: "REMEDIATION_EXECUTED",
+                accountId: "ambient",
+                bucketName: targetBucket,
+                targetCount: lifecycleInput.LifecycleConfiguration?.Rules?.length ?? 0,
+                planHash,
+                xAmzRequestIds: reqId ? [reqId] : [],
+                details: {
+                  policyId: policyDoc.policyId,
+                  action: resolved.action,
+                  undoManifest: undoResult.manifestPath,
+                },
+              })
+            );
+            await auditWriter.close();
+          } catch {
+            // best-effort audit log
+          }
+
+          if (isJson) {
+            log(
+              JSON.stringify(
+                {
+                  success: true,
+                  bucket: targetBucket,
+                  policyId: policyDoc.policyId,
+                  effectiveAction: resolved.action,
+                  rulesApplied: lifecycleInput.LifecycleConfiguration?.Rules?.length ?? 0,
+                  undoManifest: undoResult.manifestPath,
+                  planHash,
+                  requestId: reqId,
+                },
+                null,
+                2
+              )
+            );
+            return EXIT_CODES.SUCCESS;
+          }
+
+          log(`\n🚀 Applied declarative policy to '${targetBucket}' successfully!`);
+          log(`  Policy ID:              ${policyDoc.policyId}`);
+          log(`  Action Mode:            ${resolved.action}`);
+          log(`  Rules Applied:          ${lifecycleInput.LifecycleConfiguration?.Rules?.length ?? 0}`);
+          log(`  Plan Hash:              ${planHash}`);
+          log(`  Undo Manifest:          ${undoResult.manifestPath}`);
+          if (reqId) {
+            log(`  AWS Request ID:         ${reqId}`);
+          }
+          return EXIT_CODES.SUCCESS;
+        }
+
+        default: {
+          error(`Error: Unknown policy subcommand '${sub}'. Expected 'validate', 'plan', or 'apply'.`);
+          return EXIT_CODES.ARG_ERROR;
+        }
       }
     }
 

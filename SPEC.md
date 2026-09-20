@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.8.0  
+**Version:** 1.9.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -609,3 +609,68 @@ interface DeletionCertificate {
   Displays formatted SOC 2 / ISO 27001 deletion certificates with cryptographic planHash and CloudTrail traces.
 - **`s3-guardian rehydrate <bucket> [--dry-run] [--older-than <timestamp>] [--json]`:**
   Discovers latest Delete Markers and pops tombstones to restore hidden object data versions.
+
+---
+
+## 17. Declarative Storage Policy Engine & Precedence Hierarchy (v1.9.0)
+
+### 17.1 Declarative Storage Policy Schema (`GuardianPolicy`)
+Policies are expressed in JSON or the zero-dependency Guardian YAML subset conforming to `schemaVersion: "1"`.
+
+```typescript
+export interface GuardianPolicy {
+  schemaVersion: "1";
+  policyId: string;
+  scope: {
+    level: "GLOBAL" | "OU" | "ACCOUNT" | "BUCKET_TAG" | "OBJECT_TAG";
+    organizationId?: string;
+    ouId?: string;
+    accountId?: string;
+    priority?: number;
+  };
+  defaults?: {
+    action?: "MONITOR_ONLY" | "PLAN_ONLY" | "AUTO_REMEDIATE";
+    mpuAbortDays?: number;
+    retainVersions?: number;
+    maxNoncurrentDays?: number;
+  };
+  rules: PolicyRule[];
+}
+```
+
+### 17.2 Zero-Dependency YAML/JSON Subset Parser
+The parser processes declarative documents using Node 20+ built-ins with zero third-party dependencies:
+- **Comments & Quotes:** Strips non-quoted comments (`#`) while preserving quoted strings and escaped quotes.
+- **Indentation Hygiene:** Enforces indentation with spaces and strictly rejects tab characters (`\t`) with syntax errors.
+- **Scalar Units:** Natively translates human duration scalars (`7d` $\to 7$, `24h` $\to 1$, `2w` $\to 14$) and human size scalars (`128KiB` $\to 128$, `1MiB` $\to 1024$, `1GiB` $\to 1048576$).
+
+### 17.3 Precedence Hierarchy & Leaf-Level Merging
+When multiple policies match a bucket, rules are resolved hierarchically:
+$$\text{OBJECT\_TAG (40)} > \text{BUCKET\_TAG (30)} > \text{ACCOUNT (25)} > \text{OU (20)} > \text{GLOBAL (10)}$$
+- **Explicit Priority:** Scope priority integers resolve ties between policies at the same organizational level.
+- **Leaf-Level Merging:** Properties are merged per object match criteria at the leaf level (`mpuAbortDays`, `expirationDays`, `transitions`, `noncurrentExpirationDays`, `retainVersions`, `minSizeKb`).
+- **Provenance Tracking:** Every effective property maintains provenance metadata (`{ policyId, ruleId, level }`) detailing its governance origin.
+
+### 17.4 Fail-Safe Action Mode
+To prevent accidental mutation across organizational hierarchies, the most restrictive action mode unconditionally wins:
+$$\text{MONITOR\_ONLY (1)} < \text{PLAN\_ONLY (2)} < \text{AUTO\_REMEDIATE (3)}$$
+If any matching policy or rule specifies `MONITOR_ONLY`, all automated and manual mutations on that bucket are prohibited.
+
+### 17.5 Static FinOps Validator & Safety Guards
+- **AWS API Constraints:** Rules per policy $\le 1000$, rule ID length $\le 255$, unique rule IDs, `retainVersions` $\in [1, 100]$.
+- **MPU Churn Guard:** `mpuAbortDays` must be $\ge 7$ days in rules and defaults to avoid aborting active in-flight multipart uploads.
+- **Tag/MPU Contradiction Guard:** AWS S3 strictly forbids tag filters inside `AbortIncompleteMultipartUpload`. The validator rejects rules combining `mpuAbortDays` with `object.tags`.
+- **128 KiB Floor Guard:** Transitions to `STANDARD_IA`, `ONEZONE_IA`, `GLACIER_IR`, `GLACIER`, and `DEEP_ARCHIVE` require `minSizeKb >= 128` (`INTELLIGENT_TIERING` is exempt).
+- **Early Deletion Penalty Guard:** Verifies minimum retention periods to prevent premature deletion charges: $\ge 90$ days for Glacier/GIR, and $\ge 180$ days for Deep Archive.
+
+### 17.6 AWS Lifecycle Compiler (`compileToLifecycleConfiguration`)
+- **MPU Abort Rule Splitting:** Automatically splits rules containing both MPU abort actions and object tags into an MPU abort rule (`${rule.id}-abort-mpu` without tags) and an object lifecycle rule (with tags and transitions).
+- **Filter Synthesis:** Employs single criterion filters (`Prefix`, `Tag`, `ObjectSizeGreaterThan`) or multi-criteria `And` blocks.
+- **128 KiB Floor Injection:** Enforces `ObjectSizeGreaterThan >= 131072` bytes for storage classes subject to minimum capacity charges.
+- **Enabled Guarantee:** All compiled lifecycle rules enforce `Status: "Enabled"`.
+
+### 17.7 CLI Commands
+- **`s3-guardian policy validate <file> [--json]`:** Statically validates policy syntax, AWS constraints, and FinOps safety guards.
+- **`s3-guardian policy plan <bucket> --policy <file> [--out <file>] [--json]`:** Resolves bucket tags, hierarchy precedence, leaf merges, and outputs compiled PutBucketLifecycleConfiguration JSON preview.
+- **`s3-guardian policy apply <bucket> --policy <file> --confirm [--state-dir <path>] [--json]`:** Captures pre-state, applies compiled configuration to AWS S3, and writes an immutable `UndoManifest` for rollback.
+- **`s3-guardian scan --all-buckets --policy <file>`:** Audits declarative storage policy compliance across all discovered fleet buckets.

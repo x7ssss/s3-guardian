@@ -9,6 +9,7 @@ import {
   AbortMultipartUploadCommand,
   GetBucketLifecycleConfigurationCommand,
   PutBucketLifecycleConfigurationCommand,
+  GetBucketTaggingCommand,
   ListObjectVersionsCommand,
   DeleteObjectsCommand,
   ListObjectsV2Command,
@@ -69,7 +70,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.8.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.9.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1904,6 +1905,244 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       expect(jsonOut.restoredCount).toBe(1);
       expect(jsonOut.deletedMarkers[0].VersionId).toBe("dm-pop-1");
       expect(s3Mock.commandCalls(DeleteObjectsCommand).length).toBe(1);
+    });
+  });
+
+  describe("Declarative Storage Policy Engine Subcommands (v1.9.0)", () => {
+    let tmpDir: string;
+
+    beforeEach(async () => {
+      tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "s3-guardian-policy-cli-"));
+    });
+
+    afterEach(async () => {
+      try {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      } catch {}
+    });
+
+    it("policy validate succeeds on valid policy document", async () => {
+      const policyPath = path.join(tmpDir, "valid-policy.yaml");
+      await fs.writeFile(
+        policyPath,
+        `
+schemaVersion: "1"
+policyId: valid-yaml-policy
+scope:
+  level: BUCKET_TAG
+rules:
+  - id: cleanup-scratch
+    match:
+      object:
+        prefix: scratch/
+    mpuAbortDays: 7d
+    expirationDays: 30d
+`,
+        "utf8"
+      );
+
+      const code = await main(["policy", "validate", policyPath], captureIO);
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Policy 'valid-yaml-policy' is valid");
+    });
+
+    it("policy validate fails with exit code 1 on policy validation invariant breach", async () => {
+      const badPolicyPath = path.join(tmpDir, "bad-policy.yaml");
+      await fs.writeFile(
+        badPolicyPath,
+        `
+schemaVersion: "1"
+policyId: churn-violation-policy
+scope:
+  level: GLOBAL
+rules:
+  - id: dangerous-short-mpu
+    match: {}
+    mpuAbortDays: 2d # < 7 days
+`,
+        "utf8"
+      );
+
+      const code = await main(["policy", "validate", badPolicyPath], captureIO);
+      expect(code).toBe(1);
+      expect(stderrLogs.join(" ")).toContain("Policy validation failed");
+      expect(stderrLogs.join(" ")).toContain("mpuAbortDays < 7");
+    });
+
+    it("policy plan generates and previews compiled lifecycle configuration", async () => {
+      const policyPath = path.join(tmpDir, "plan-policy.yaml");
+      await fs.writeFile(
+        policyPath,
+        `
+schemaVersion: "1"
+policyId: plan-preview-policy
+scope:
+  level: BUCKET_TAG
+rules:
+  - id: mpu-abort-rule
+    match:
+      object:
+        prefix: uploads/
+    mpuAbortDays: 7d
+`,
+        "utf8"
+      );
+
+      s3Mock.on(GetBucketLocationCommand, { Bucket: "plan-target-bucket" }).resolves({
+        LocationConstraint: "us-east-1",
+      });
+      s3Mock.on(GetBucketTaggingCommand, { Bucket: "plan-target-bucket" }).resolves({
+        TagSet: [{ Key: "Env", Value: "Test" }],
+      });
+
+      const outPlanPath = path.join(tmpDir, "output-plan.json");
+      const code = await main(
+        ["policy", "plan", "plan-target-bucket", "--policy", policyPath, "--out", outPlanPath],
+        captureIO
+      );
+
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Declarative Policy Plan for 'plan-target-bucket'");
+      expect(stdoutLogs.join(" ")).toContain("Compiled AWS Rules:     1");
+
+      const savedPlan = JSON.parse(await fs.readFile(outPlanPath, "utf8"));
+      expect(savedPlan.bucket).toBe("plan-target-bucket");
+      expect(savedPlan.policyId).toBe("plan-preview-policy");
+      expect(savedPlan.compiledLifecycleConfiguration.Rules[0].ID).toBe("mpu-abort-rule");
+    });
+
+    it("policy apply requires --confirm and applies compiled lifecycle with UndoManifest", async () => {
+      const policyPath = path.join(tmpDir, "apply-policy.yaml");
+      await fs.writeFile(
+        policyPath,
+        `
+schemaVersion: "1"
+policyId: apply-policy
+scope:
+  level: BUCKET_TAG
+rules:
+  - id: apply-rule
+    action: AUTO_REMEDIATE
+    match:
+      object:
+        prefix: data/
+    mpuAbortDays: 7d
+`,
+        "utf8"
+      );
+
+      // Without --confirm: must error
+      const failCode = await main(
+        ["policy", "apply", "apply-target-bucket", "--policy", policyPath],
+        captureIO
+      );
+      expect(failCode).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("'--confirm' is strictly required");
+
+      stderrLogs = [];
+      stdoutLogs = [];
+
+      // Stub S3 interactions for apply
+      s3Mock.on(GetBucketLocationCommand, { Bucket: "apply-target-bucket" }).resolves({
+        LocationConstraint: "us-east-1",
+      });
+      s3Mock.on(GetBucketTaggingCommand, { Bucket: "apply-target-bucket" }).resolves({
+        TagSet: [],
+      });
+      s3Mock.on(GetBucketLifecycleConfigurationCommand, { Bucket: "apply-target-bucket" }).resolves({
+        Rules: [],
+      });
+      s3Mock.on(PutBucketLifecycleConfigurationCommand, { Bucket: "apply-target-bucket" }).resolves({
+        $metadata: { requestId: "req-apply-policy-1" },
+      });
+
+      const successCode = await main(
+        [
+          "policy",
+          "apply",
+          "apply-target-bucket",
+          "--policy",
+          policyPath,
+          "--confirm",
+          "--state-dir",
+          tmpDir,
+        ],
+        captureIO
+      );
+
+      expect(successCode).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Applied declarative policy to 'apply-target-bucket' successfully");
+      expect(stdoutLogs.join(" ")).toContain("Undo Manifest:");
+      expect(s3Mock.commandCalls(PutBucketLifecycleConfigurationCommand).length).toBe(1);
+    });
+
+    it("policy apply blocks mutation when resolved action mode is MONITOR_ONLY", async () => {
+      const monitorPolicyPath = path.join(tmpDir, "monitor-policy.yaml");
+      await fs.writeFile(
+        monitorPolicyPath,
+        `
+schemaVersion: "1"
+policyId: monitor-only-policy
+scope:
+  level: GLOBAL
+rules:
+  - id: read-only-rule
+    action: MONITOR_ONLY
+    match: {}
+    mpuAbortDays: 7d
+`,
+        "utf8"
+      );
+
+      s3Mock.on(GetBucketLocationCommand, { Bucket: "monitor-bucket" }).resolves({
+        LocationConstraint: "us-east-1",
+      });
+      s3Mock.on(GetBucketTaggingCommand, { Bucket: "monitor-bucket" }).resolves({
+        TagSet: [],
+      });
+
+      const code = await main(
+        ["policy", "apply", "monitor-bucket", "--policy", monitorPolicyPath, "--confirm"],
+        captureIO
+      );
+
+      expect(code).toBe(1);
+      expect(stderrLogs.join(" ")).toContain("Policy execution blocked: Resolved action mode is MONITOR_ONLY");
+      expect(s3Mock.commandCalls(PutBucketLifecycleConfigurationCommand).length).toBe(0);
+    });
+
+    it("scan --all-buckets with --policy flags non-compliant buckets", async () => {
+      const compliancePolicyPath = path.join(tmpDir, "compliance-policy.yaml");
+      await fs.writeFile(
+        compliancePolicyPath,
+        `
+schemaVersion: "1"
+policyId: compliance-audit-policy
+scope:
+  level: GLOBAL
+rules:
+  - id: org-wide-mpu-cleanup
+    match: {}
+    mpuAbortDays: 7d
+`,
+        "utf8"
+      );
+
+      s3Mock.on(ListBucketsCommand).resolves({
+        Buckets: [{ Name: "unprotected-bucket" }],
+      });
+      s3Mock.on(GetBucketLocationCommand).resolves({ LocationConstraint: "us-east-1" });
+      s3Mock.on(ListMultipartUploadsCommand).resolves({ Uploads: [] });
+      stubNoLifecycle(); // bucket lacks lifecycle configuration
+
+      const code = await main(
+        ["scan", "--all-buckets", "--policy", compliancePolicyPath],
+        captureIO
+      );
+
+      expect(code).toBe(1);
+      expect(stdoutLogs.join(" ")).toContain("Declarative Policy Compliance (compliance-audit-policy)");
+      expect(stdoutLogs.join(" ")).toContain("Non-Compliant Buckets:  1");
     });
   });
 });

@@ -304,6 +304,32 @@ export {
   CreateDeletionCertificateParams,
   ExecuteRollbackOptions,
 } from "./rollback/index.js";
+export {
+  PolicyLevel,
+  ActionMode,
+  StorageClass,
+  PolicyScope,
+  PolicyDefaults,
+  BucketMatchCriteria,
+  ObjectMatchCriteria,
+  RuleMatchCriteria,
+  RuleTransition,
+  PolicyRule,
+  GuardianPolicy,
+  RuleProvenance,
+  EffectivePolicyRule,
+  ResolvedPolicy,
+  BucketMetadata,
+  PolicyValidationResult,
+  POLICY_LEVEL_PRECEDENCE,
+  ACTION_MODE_PRECEDENCE,
+  parseScalar,
+  parseYamlSubset,
+  parsePolicyDocument,
+  validatePolicy,
+  resolveBucketPolicy,
+  compileToLifecycleConfiguration,
+} from "./policy/index.js";
 
 
 

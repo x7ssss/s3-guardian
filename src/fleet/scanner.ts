@@ -20,7 +20,7 @@ import {
 
 /**
  * Thrown when ListBuckets fails due to an authentication/authorization error.
- * Maps to CLI exit code 3.
+ * Maps to CLI exit code 2 (AUTH_IAM_ERROR).
  */
 export class DiscoveryAuthError extends Error {
   constructor(message: string, public readonly cause?: unknown) {

@@ -1,57 +1,46 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.9.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v2.0.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
 
-Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned multipart uploads, noncurrent object versions, and lifecycle transition traps across AWS S3 and multi-cloud S3 stores (Cloudflare R2, Wasabi, Backblaze B2, MinIO, Ceph).
+Enterprise-grade autonomous cloud storage governance platform and CLI to detect, quantify, and safely clean up abandoned multipart uploads, noncurrent object versions, and lifecycle transition traps across AWS S3 and multi-cloud S3 stores (Cloudflare R2, Wasabi, Backblaze B2, MinIO, Ceph).
 
 ---
 
-## Architectural Workflow
+## Autonomous Sovereign Operator State Machine
+
+`s3-guardian v2.0.0` introduces the **Autonomous Sovereign Operator**, a continuous 9-phase daemon engine running autonomous storage governance:
 
 ```
-               ┌─────────────────────────────────────────────────┐
-               │              Storage Lens Export CSV            │
-               └───────────────────────┬─────────────────────────┘
-                                       │ (lens: zero data-plane)
-                                       ▼
-┌──────────────────┐           ┌──────────────┐
-│ AWS Organizations│ ──(org)─▶ │   SCANNER    │ ◀── Ambient Credentials / STS Pool
-└──────────────────┘           └───────┬──────┘
-                                       │
-                                       ▼
-                               ┌──────────────┐
-                               │   PLANNER    │ ── Schema 1.3 + RFC 8785 SHA-256
-                               └───────┬──────┘
-                                       │
-                                       ▼
-                               ┌──────────────┐
-                               │ BLAST RADIUS │ ── Pre-Flight Simulator:
-                               │  SIMULATOR   │    • S3 Object Lock (Compliance/Governance)
-                               └───────┬──────┘    • CRR/SRR Replication Divergence Guard
-                                       │           • Protected Prefixes (_wal/, iceberg/, ...)
-                                       │           • Tag Exclusions & Active Churn (<24h)
-                                       ▼
-                               ┌──────────────┐
-                               │ CANARY GATE  │ ── 10-Target Pre-Flight Probe:
-                               │  VERIFIER    │    • Isolated Deletion + HeadObject Verification
-                               └───────┬──────┘
-                                       │
-                                       ▼
-                               ┌──────────────┐
-                               │   EXECUTOR   │ ── Autonomous Circuit Breaker (CLOSED/OPEN/HALF_OPEN)
-                               └───────┬──────┘    • Zero-Allocation Float32Array Error Tracking
-                                       │           • Dynamic 503 Concurrency Halving & Burst Trip
-                                       │           • 403 Hard Cliff Trip & 400 BadDigest Quarantine
-                                       │           • Bounded Concurrency & Quiet Batch Inspection
-                                       │           • Forensic CloudTrail Correlation Tracing
-                                       ▼
-                   ┌───────────────────────────────────────┐
-                   │ S3 Multipart Aborts / Version Purges  │
-                   └───────────────────────────────────────┘
+┌─────────────┐     ┌──────────────┐     ┌─────────────────────┐
+│  DISCOVERY  │ ──▶ │ POLICY_MATCH │ ──▶ │ BLAST_RADIUS_AUDIT  │
+└─────────────┘     └──────────────┘     └──────────┬──────────┘
+                                                    │
+       ┌────────────────────────────────────────────┘
+       ▼
+┌─────────────┐     ┌────────────────┐     ┌──────────────┐
+│ CANARY_TEST │ ──▶ │ CIRCUIT_VERIFY │ ──▶ │ BULK_EXECUTE │
+└─────────────┘     └────────────────┘     └───────┬──────┘
+                                                   │
+       ┌───────────────────────────────────────────┘
+       ▼
+┌─────────────┐     ┌─────────────┐     ┌───────┐
+│  AUDIT_LOG  │ ──▶ │ UNDO_EXPORT │ ──▶ │ SLEEP │ ──(next epoch)──▶ [DISCOVERY]
+└─────────────┘     └─────────────┘     └───────┘
 ```
+
+1. **DISCOVERY**: Paginates targets across accounts/buckets with cursor resumption.
+2. **POLICY_MATCH**: Evaluates discovered inventory against declarative policy engine (YAML subset).
+3. **BLAST_RADIUS_AUDIT**: Simulates relative mutation ceiling ($\le 5\%$), Object Lock (`COMPLIANCE`/`GOVERNANCE`), and replication divergence.
+4. **CANARY_TEST**: Dispatches isolated canary deletion probe before bulk mutation.
+5. **CIRCUIT_VERIFY**: Verifies circuit breaker state; halts immediately if error rates spiked.
+6. **BULK_EXECUTE**: Bounded concurrency worker pool draining mutation queue.
+7. **AUDIT_LOG**: Streaming JSONL append to immutable audit ledger.
+8. **UNDO_EXPORT**: Generates cryptographic `UndoManifest` and SOC 2 / ISO 27001 `DeletionCertificate`.
+9. **SLEEP**: High-resolution monotonic sleep subtracting epoch run duration; resets circuit breaker half-open probes.
+10. **HALTED**: Safety state entered if safety gates trip, preventing catastrophic fleet mutations.
 
 ---
 
@@ -99,16 +88,50 @@ npx s3-guardian --help
 npm install -g s3-guardian
 ```
 
-### Build Single Executable Application (SEA)
+### Single Executable Application (SEA)
+Download pre-built, self-contained standalone binaries (zero Node.js runtime required) from GitHub Releases for:
+- Linux (`x86_64`, `aarch64`)
+- macOS (`x86_64`, `arm64` Apple Silicon)
+- Windows (`x64`)
+
+Or compile locally for your current host platform:
 ```bash
 npm run build:sea
+# Generates dist/s3-guardian (or dist/s3-guardian.exe on Windows)
+./dist/s3-guardian --version
 ```
+
+### Air-Gapped Trust Stores (`NODE_EXTRA_CA_CERTS`)
+In air-gapped or private cloud environments with corporate intercepting proxies or custom internal Root CAs, point `NODE_EXTRA_CA_CERTS` to your PEM bundle:
+```bash
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/corporate-root-ca.pem
+s3-guardian operate --all-buckets
+```
+`s3-guardian` dynamically registers all PEM certificates into Node's secure context and HTTPS agent on initialization.
 
 ---
 
 ## Commands & Usage Guide
 
-### 1. `scan`: Read-Only Inspection
+### 1. `operate`: Autonomous Sovereign Operator (v2.0.0)
+
+Executes continuous 9-phase autonomous storage governance state machine:
+
+```bash
+# Continuous fleet governance with 1-hour intervals and 5% mutation ceiling
+s3-guardian operate --interval 1h --max-blast-radius 5
+
+# Continuous governance governed by declarative policy document
+s3-guardian operate --policy ./corporate-storage-policy.yaml
+
+# Single bucket one-shot dry-run epoch with JSON metrics output
+s3-guardian operate my-bucket --once --dry-run --json
+
+# Run against S3-compatible private cloud (MinIO / Ceph)
+s3-guardian operate my-bucket --endpoint https://s3.internal.lan --force-path-style
+```
+
+### 2. `scan`: Read-Only Inspection
 
 Inspect incomplete multipart uploads without modifying bucket state:
 
@@ -619,14 +642,19 @@ s3-guardian scan --all-buckets --policy policy.yaml
 
 ---
 
-## POSIX Exit Codes
+## SemVer 2.0 Exit Code Contract
 
-| Exit Code | Classification | Description |
+`s3-guardian v2.0.0` establishes a strict, stable exit code contract across all CLI subcommands, operators, and CI/CD pipelines:
+
+| Exit Code | Classification | SemVer Contract Description |
 | :--- | :--- | :--- |
-| `0` | `SUCCESS` | Scan clean, plan generated, apply completed, or policies satisfied |
-| `1` | `POLICY_VIOLATION` | Safety gate tripped (Object Lock, churn, tampered plan, Wasabi retention, mutation ceiling) or CI/CD budget breached |
-| `2` | `ARG_ERROR` | Missing required parameters, invalid flags, or syntax error |
-| `3` | `DISCOVERY_AUTH_ERROR` | AWS Organizations discovery failure, STS AssumeRole denied, or missing credentials |
+| `0` | `SUCCESS` | Successful execution; scan clean, plan generated, apply completed, or policies satisfied |
+| `1` | `CONFIG_ARG_ERROR` | CLI configuration, syntax, or argument error (invalid duration, missing required bucket/manifest) |
+| `2` | `AUTH_IAM_ERROR` | Authentication failure, IAM AccessDenied, Organizations discovery failure, or STS AssumeRole rejection |
+| `3` | `POLICY_VIOLATION` | Declarative policy rule violation, policy validation invariant breach, `--max-waste-usd` exceeded, or unapproved IaC drift |
+| `4` | `CIRCUIT_CANARY_BLAST_RADIUS` | Circuit breaker tripped (OPEN), canary verification probe failed, relative blast radius ceiling breached, or Wasabi 90-day retention guard triggered |
+| `5` | `FS_STATE_ERROR` | Local or remote filesystem / state store corruption, unreadable state file, or I/O failure |
+| `6` | `NETWORK_TIMEOUT` | Network connection refused, DNS timeout, socket timeout (`ETIMEDOUT`), or AWS SDK `TimeoutError` |
 
 ---
 

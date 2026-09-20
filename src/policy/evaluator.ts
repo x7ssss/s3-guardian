@@ -1,15 +1,24 @@
 import type { FleetScanResult } from "../fleet/scanner.js";
 
-/** Exit codes enforced by the policy evaluator. */
+/** Exit codes enforced across s3-guardian (SemVer 2.0 Exit Code Contract). */
 export const EXIT_CODES = {
-  /** Success, no policy violations. */
+  /** 0: Success, no policy violations. */
   SUCCESS: 0,
-  /** Policy threshold breached (--max-waste-usd or --fail-on-unprotected). */
-  POLICY_VIOLATION: 1,
-  /** CLI argument / syntax error. */
-  ARG_ERROR: 2,
-  /** Account discovery / authentication failure. */
-  DISCOVERY_AUTH_ERROR: 3,
+  /** 1: CLI configuration, syntax, or argument error. */
+  CONFIG_ARG_ERROR: 1,
+  ARG_ERROR: 1,
+  /** 2: Authentication or IAM authorization failure. */
+  AUTH_IAM_ERROR: 2,
+  DISCOVERY_AUTH_ERROR: 2,
+  /** 3: Policy threshold breached, declarative policy violation, or unapproved drift. */
+  POLICY_VIOLATION: 3,
+  /** 4: Circuit breaker tripped, canary verification failed, or blast radius ceiling breached. */
+  CIRCUIT_CANARY_BLAST_RADIUS: 4,
+  SAFETY_CIRCUIT_ERROR: 4,
+  /** 5: Local or remote filesystem / state store corruption or I/O failure. */
+  FS_STATE_ERROR: 5,
+  /** 6: Network connection refused, DNS timeout, or socket timeout. */
+  NETWORK_TIMEOUT: 6,
 } as const;
 
 export type ExitCode = (typeof EXIT_CODES)[keyof typeof EXIT_CODES];

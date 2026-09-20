@@ -1,0 +1,146 @@
+name: Release SEA Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build SEA (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            target: linux-x64
+            is_windows: false
+            is_macos: false
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            target: linux-arm64
+            is_windows: false
+            is_macos: false
+          - os: macos-13
+            arch: x64
+            target: darwin-x64
+            is_windows: false
+            is_macos: true
+          - os: macos-14
+            arch: arm64
+            target: darwin-arm64
+            is_windows: false
+            is_macos: true
+          - os: windows-latest
+            arch: x64
+            target: windows-x64
+            is_windows: true
+            is_macos: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript & bundle CJS
+        run: |
+          npm run build
+          npm run build:bundle
+
+      - name: Generate SEA preparation blob
+        run: node --experimental-sea-config sea-config.json
+
+      # ── Unix / macOS preparation ──
+      - name: Prepare binary on Unix
+        if: ${{ !matrix.is_windows }}
+        run: |
+          mkdir -p dist
+          cp $(which node) dist/s3-guardian
+
+      - name: macOS Code Signing adjustments
+        if: ${{ matrix.is_macos }}
+        run: |
+          codesign --remove-signature dist/s3-guardian
+
+      - name: Inject blob on macOS
+        if: ${{ matrix.is_macos }}
+        run: |
+          npx postject dist/s3-guardian NODE_SEA_BLOB dist/sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 \
+            --macho-segment-name NODE_SEA
+          codesign --sign - dist/s3-guardian
+
+      - name: Inject blob on Linux
+        if: ${{ !matrix.is_windows && !matrix.is_macos }}
+        run: |
+          npx postject dist/s3-guardian NODE_SEA_BLOB dist/sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+
+      - name: Package Unix archive
+        if: ${{ !matrix.is_windows }}
+        run: |
+          chmod +x dist/s3-guardian
+          tar -czvf "s3-guardian-${{ matrix.target }}.tar.gz" -C dist s3-guardian
+
+      # ── Windows preparation ──
+      - name: Prepare & inject binary on Windows
+        if: ${{ matrix.is_windows }}
+        shell: pwsh
+        run: |
+          Copy-Item (Get-Command node).Source dist/s3-guardian.exe
+          npx postject dist/s3-guardian.exe NODE_SEA_BLOB dist/sea-prep.blob `
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          Compress-Archive -Path dist/s3-guardian.exe -DestinationPath "s3-guardian-${{ matrix.target }}.zip"
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-guardian-${{ matrix.target }}
+          path: |
+            s3-guardian-${{ matrix.target }}.tar.gz
+            s3-guardian-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Package Release & Checksums
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS manifest
+        run: |
+          cd artifacts
+          sha256sum s3-guardian-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/s3-guardian-*
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: false

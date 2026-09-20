@@ -374,3 +374,24 @@ export function resolveBucketPolicy(
     provenance,
   };
 }
+
+/**
+ * Programmatic SDK helper to evaluate declarative policies across one or more buckets.
+ */
+export function evaluatePolicies(
+  bucket: BucketMetadata,
+  policies: GuardianPolicy[]
+): ResolvedPolicy;
+export function evaluatePolicies(
+  buckets: BucketMetadata[],
+  policies: GuardianPolicy[]
+): ResolvedPolicy[];
+export function evaluatePolicies(
+  bucketOrBuckets: BucketMetadata | BucketMetadata[],
+  policies: GuardianPolicy[]
+): ResolvedPolicy | ResolvedPolicy[] {
+  if (Array.isArray(bucketOrBuckets)) {
+    return bucketOrBuckets.map((b) => resolveBucketPolicy(b, policies));
+  }
+  return resolveBucketPolicy(bucketOrBuckets, policies);
+}

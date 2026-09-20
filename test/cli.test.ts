@@ -70,7 +70,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.9.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v2.0.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -84,15 +84,15 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(stdoutLogs.join(" ")).toContain("USAGE:");
   });
 
-  it("returns 2 for unknown command", async () => {
+  it("returns 1 for unknown command", async () => {
     const code = await main(["foobar"], captureIO);
-    expect(code).toBe(2);
+    expect(code).toBe(1);
     expect(stderrLogs.join(" ")).toContain("Unknown command 'foobar'");
   });
 
-  it("scan returns 2 if bucket is omitted", async () => {
+  it("scan returns 1 if bucket is omitted", async () => {
     const code = await main(["scan"], captureIO);
-    expect(code).toBe(2);
+    expect(code).toBe(1);
     expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'scan'");
   });
 
@@ -341,7 +341,7 @@ describe("CLI entrypoint and subcommand flow", () => {
     try {
       // Without --confirm
       const code = await main(["apply", "--plan", tempFile], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("Safety check failed: The '--confirm' flag is strictly required");
       expect(s3Mock.calls().length).toBe(0);
     } finally {
@@ -534,9 +534,9 @@ describe("CLI entrypoint and subcommand flow", () => {
     }
   });
 
-  it("remediate returns 2 if bucket is omitted and not --all-buckets", async () => {
+  it("remediate returns 1 if bucket is omitted and not --all-buckets", async () => {
     const code = await main(["remediate"], captureIO);
-    expect(code).toBe(2);
+    expect(code).toBe(1);
     expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'remediate'");
   });
 
@@ -890,13 +890,13 @@ describe("CLI entrypoint and subcommand flow", () => {
       captureIO
     );
 
-    expect(code).toBe(1); // POLICY_VIOLATION
+    expect(code).toBe(3); // POLICY_VIOLATION
     expect(stdoutLogs.join("\n")).toContain("Policy violations detected");
   });
 
-  it("lens returns 2 if source argument is missing", async () => {
+  it("lens returns 1 if source argument is missing", async () => {
     const code = await main(["lens"], captureIO);
-    expect(code).toBe(2);
+    expect(code).toBe(1);
     expect(stderrLogs.join("\n")).toContain("<source> is required for 'lens'");
   });
 
@@ -965,9 +965,9 @@ describe("CLI entrypoint and subcommand flow", () => {
 
   // ─── Transition Auditor CLI Tests ──────────────────────────────────────────
 
-  it("audit-transitions returns 2 if bucket is omitted and not --all-buckets", async () => {
+  it("audit-transitions returns 1 if bucket is omitted and not --all-buckets", async () => {
     const code = await main(["audit-transitions"], captureIO);
-    expect(code).toBe(2);
+    expect(code).toBe(1);
     expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'audit-transitions'");
   });
 
@@ -1126,9 +1126,9 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(tableOutput).toContain("Actionable Tip: Small-object transition traps detected!");
   });
 
-  it("rejects invalid --interval format with exit code 2", async () => {
+  it("rejects invalid --interval format with exit code 1", async () => {
     const code = await main(["scan", "test-bucket", "--interval", "invalid-time"], captureIO);
-    expect(code).toBe(2);
+    expect(code).toBe(1);
     expect(stderrLogs.join(" ")).toContain("Invalid interval format");
   });
 
@@ -1147,7 +1147,7 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(output).toContain("Clean! No multipart uploads");
   });
 
-  it("reports daemon lock conflict with exit code 2 when lock already held", async () => {
+  it("reports daemon lock conflict with exit code 1 when lock already held", async () => {
     s3Mock.on(ListMultipartUploadsCommand).resolves({
       Uploads: [],
     });
@@ -1158,7 +1158,7 @@ describe("CLI entrypoint and subcommand flow", () => {
 
     try {
       const code = await main(["scan", "conflict_bucket", "--daemon", "--once"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("Daemon lock conflict");
     } finally {
       try {
@@ -1196,21 +1196,21 @@ describe("CLI entrypoint and subcommand flow", () => {
       } catch {}
     });
 
-    it("returns 2 if bucket name is missing", async () => {
+    it("returns 1 if bucket name is missing", async () => {
       const code = await main(["drift"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'drift'");
     });
 
-    it("returns 2 if neither --tf-file nor --tfstate is provided", async () => {
+    it("returns 1 if neither --tf-file nor --tfstate is provided", async () => {
       const code = await main(["drift", "my-bucket"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("Either --tf-file <path> or --tfstate <path> must be provided");
     });
 
-    it("returns 2 if --tf-file does not exist", async () => {
+    it("returns 1 if --tf-file does not exist", async () => {
       const code = await main(["drift", "my-bucket", "--tf-file", "nonexistent-file.tf"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("Target Terraform file not found");
     });
 
@@ -1295,8 +1295,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       await fs.writeFile(testTfFile, initialTf, "utf8");
 
       const code = await main(["drift", "write-bucket", "--tf-file", testTfFile, "--write"], captureIO);
-      // Returns 1 because drift was detected (before write)
-      expect(code).toBe(1);
+      // Returns 3 because drift was detected (POLICY_VIOLATION)
+      expect(code).toBe(3);
 
       const tableOutput = stdoutLogs.join("\n");
       expect(tableOutput).toContain("Resource Type");
@@ -1431,7 +1431,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
         ],
         captureIO
       );
-      expect(blockedCode).toBe(1);
+      expect(blockedCode).toBe(4);
       expect(stderrLogs.join("\n")).toContain("Wasabi charges 90 days minimum retention");
 
       // Now attempt apply WITH --force-wasabi-early-delete -> should succeed with exit code 0
@@ -1458,16 +1458,16 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
   });
 
   describe("Interactive Dashboard / TUI subcommand", () => {
-    it("dashboard rejects non-interactive terminal (non-TTY) with code 2", async () => {
+    it("dashboard rejects non-interactive terminal (non-TTY) with code 1", async () => {
       const code = await main(["dashboard"], { ...captureIO, isTTY: false });
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join("\n")).toContain("Interactive dashboard requires an interactive terminal (TTY)");
       expect(stderrLogs.join("\n")).toContain("s3-guardian scan --all-buckets");
     });
 
-    it("tui alias rejects non-interactive terminal (non-TTY) with code 2", async () => {
+    it("tui alias rejects non-interactive terminal (non-TTY) with code 1", async () => {
       const code = await main(["tui"], { ...captureIO, isTTY: false });
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join("\n")).toContain("Interactive dashboard requires an interactive terminal (TTY)");
     });
 
@@ -1524,7 +1524,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
           ["apply", "--plan", tempFile, "--confirm", "--max-deletion-percent", "-5"],
           captureIO
         );
-        expect(code).toBe(2);
+        expect(code).toBe(1);
         expect(stderrLogs.join("\n")).toContain("Error: --max-deletion-percent must be a positive number.");
       } finally {
         await fs.unlink(tempFile).catch(() => {});
@@ -1558,12 +1558,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       s3Mock.on(AbortMultipartUploadCommand).resolves({});
 
       try {
-        // Run without bypass -> should fail with code 1 (POLICY_VIOLATION)
+        // Run without bypass -> should fail with code 4 (CIRCUIT_CANARY_BLAST_RADIUS)
         const failCode = await main(
           ["apply", "--plan", tempFile, "--confirm"],
           captureIO
         );
-        expect(failCode).toBe(1);
+        expect(failCode).toBe(4);
         expect(stderrLogs.join("\n")).toContain("exceed absolute safety fallback ceiling");
 
         stderrLogs = [];
@@ -1584,14 +1584,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
   });
 
   describe("State Ledger & Compactor Subcommands (v1.7.0)", () => {
-    it("state command returns 2 if subcommand is missing or invalid", async () => {
+    it("state command returns 1 if subcommand is missing or invalid", async () => {
       const code1 = await main(["state"], captureIO);
-      expect(code1).toBe(2);
+      expect(code1).toBe(1);
       expect(stderrLogs.join("\n")).toContain("Usage: s3-guardian state <compact|history>");
 
       stderrLogs = [];
       const code2 = await main(["state", "unknown"], captureIO);
-      expect(code2).toBe(2);
+      expect(code2).toBe(1);
       expect(stderrLogs.join("\n")).toContain("Unknown state subcommand 'unknown'");
     });
 
@@ -1643,7 +1643,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
 
     it("state history requires bucket argument", async () => {
       const code = await main(["state", "history"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join("\n")).toContain("is required for 'state history'");
     });
 
@@ -1759,9 +1759,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       await fs.rm(tempDir, { recursive: true, force: true });
     });
 
-    it("rollback returns 2 when manifest path is missing", async () => {
+    it("rollback returns 1 when manifest path is missing", async () => {
       const code = await main(["rollback"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("<manifest-path> is required");
     });
 
@@ -1809,9 +1809,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
         .on(GetBucketLifecycleConfigurationCommand, { Bucket: "drift-bucket" })
         .resolves({ Rules: [{ ID: "someone-else-modified-this" }] });
 
-      // 1. Without --force -> halts with exit code 1
+      // 1. Without --force -> halts with exit code 3 (POLICY_VIOLATION)
       const codeHalt = await main(["rollback", manifestRes.manifestPath, "--state-dir", tempDir], captureIO);
-      expect(codeHalt).toBe(1);
+      expect(codeHalt).toBe(3);
       expect(stderrLogs.join(" ")).toContain("Remote state drift detected");
       expect(stderrLogs.join(" ")).toContain("--force");
 
@@ -1826,9 +1826,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       expect(jsonOutput.status).toBe("RESTORED");
     });
 
-    it("certificate returns 2 when cert path is missing", async () => {
+    it("certificate returns 1 when cert path is missing", async () => {
       const code = await main(["certificate"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("<cert-path> is required");
     });
 
@@ -1859,9 +1859,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       expect(jsonOut.bucketName).toBe("audit-cert-bucket");
     });
 
-    it("rehydrate returns 2 when bucket is omitted", async () => {
+    it("rehydrate returns 1 when bucket is omitted", async () => {
       const code = await main(["rehydrate"], captureIO);
-      expect(code).toBe(2);
+      expect(code).toBe(1);
       expect(stderrLogs.join(" ")).toContain("<bucket> is required");
     });
 
@@ -1964,7 +1964,7 @@ rules:
       );
 
       const code = await main(["policy", "validate", badPolicyPath], captureIO);
-      expect(code).toBe(1);
+      expect(code).toBe(3);
       expect(stderrLogs.join(" ")).toContain("Policy validation failed");
       expect(stderrLogs.join(" ")).toContain("mpuAbortDays < 7");
     });
@@ -2036,7 +2036,7 @@ rules:
         ["policy", "apply", "apply-target-bucket", "--policy", policyPath],
         captureIO
       );
-      expect(failCode).toBe(2);
+      expect(failCode).toBe(1);
       expect(stderrLogs.join(" ")).toContain("'--confirm' is strictly required");
 
       stderrLogs = [];
@@ -2106,7 +2106,7 @@ rules:
         captureIO
       );
 
-      expect(code).toBe(1);
+      expect(code).toBe(3);
       expect(stderrLogs.join(" ")).toContain("Policy execution blocked: Resolved action mode is MONITOR_ONLY");
       expect(s3Mock.commandCalls(PutBucketLifecycleConfigurationCommand).length).toBe(0);
     });
@@ -2140,9 +2140,84 @@ rules:
         captureIO
       );
 
-      expect(code).toBe(1);
+      expect(code).toBe(3);
       expect(stdoutLogs.join(" ")).toContain("Declarative Policy Compliance (compliance-audit-policy)");
       expect(stdoutLogs.join(" ")).toContain("Non-Compliant Buckets:  1");
+    });
+  });
+
+  describe("Autonomous Sovereign Operator Subcommand (v2.0.0)", () => {
+    it("operate rejects invalid --interval format with exit code 1", async () => {
+      const code = await main(["operate", "op-bucket", "--interval", "invalid-interval"], captureIO);
+      expect(code).toBe(1);
+      expect(stderrLogs.join(" ")).toContain("Invalid interval format");
+    });
+
+    it("operate rejects invalid --max-blast-radius with exit code 1", async () => {
+      const code = await main(["operate", "op-bucket", "--max-blast-radius", "-0.1"], captureIO);
+      expect(code).toBe(1);
+      expect(stderrLogs.join(" ")).toContain("--max-blast-radius must be a non-negative number");
+    });
+
+    it("operate executes single cycle with --once --dry-run and returns 0", async () => {
+      const tempOpDir = path.join(os.tmpdir(), "s3-guardian-op-cli-" + Math.random().toString(36).slice(2));
+      s3Mock.on(GetBucketLocationCommand, { Bucket: "op-bucket" }).resolves({
+        LocationConstraint: "us-east-1",
+      });
+      s3Mock.on(ListMultipartUploadsCommand, { Bucket: "op-bucket" }).resolves({
+        Uploads: [],
+      });
+
+      try {
+        const code = await main(
+          ["operate", "op-bucket", "--once", "--dry-run", "--state-dir", tempOpDir],
+          captureIO
+        );
+        expect(code).toBe(0);
+        expect(stdoutLogs.join("\n")).toContain("[OPERATOR]");
+      } finally {
+        await fs.rm(tempOpDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it("operate outputs JSON and executes policy file with --json --once --dry-run", async () => {
+      const tempOpDir = path.join(os.tmpdir(), "s3-guardian-op-cli-json-" + Math.random().toString(36).slice(2));
+      const opPolicy = path.join(tempOpDir, "op-policy.yaml");
+      await fs.mkdir(tempOpDir, { recursive: true });
+      await fs.writeFile(
+        opPolicy,
+        `
+schemaVersion: "1"
+policyId: sovereign-op-policy
+scope:
+  level: GLOBAL
+rules:
+  - id: op-rule
+    action: DRY_RUN
+    match: {}
+    mpuAbortDays: 7d
+`,
+        "utf8"
+      );
+
+      s3Mock.on(GetBucketLocationCommand, { Bucket: "op-json-bucket" }).resolves({
+        LocationConstraint: "us-east-1",
+      });
+      s3Mock.on(ListMultipartUploadsCommand, { Bucket: "op-json-bucket" }).resolves({
+        Uploads: [],
+      });
+
+      try {
+        const code = await main(
+          ["operate", "op-json-bucket", "--policy", opPolicy, "--once", "--dry-run", "--json", "--state-dir", tempOpDir],
+          captureIO
+        );
+        expect(code).toBe(0);
+        const logStr = stdoutLogs.join("\n");
+        expect(logStr).toContain("operator");
+      } finally {
+        await fs.rm(tempOpDir, { recursive: true, force: true }).catch(() => {});
+      }
     });
   });
 });

@@ -91,17 +91,21 @@ import {
   BucketMetadata,
   GuardianPolicy,
 } from "./policy/index.js";
+import { SovereignOperator, loadCustomCaCertificates } from "./operator/index.js";
+import { CanaryVerificationError } from "./safety/canary.js";
+import { isSea } from "node:sea";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 
-const VERSION = "1.9.0";
+const VERSION = "2.0.0";
 
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning waste, and transition traps
 
 USAGE:
+  s3-guardian operate [bucket] [options]
   s3-guardian scan <bucket> [options]
   s3-guardian scan --all-buckets [options]
   s3-guardian scan <bucket> --daemon [options]
@@ -134,6 +138,7 @@ USAGE:
   s3-guardian policy apply <bucket> --policy <file> --confirm [options]
 
 COMMANDS:
+  operate [bucket]        Continuous 9-phase autonomous sovereign operator state machine
   scan <bucket>           Read-only scan of incomplete multipart uploads
   scan --all-buckets      Read-only fleet scan across all account buckets
   scan --org              Multi-account sweep across AWS Organizations accounts
@@ -178,6 +183,8 @@ OPTIONS:
   --confirm                    Explicit confirmation required to execute apply deletions
   --bypass-governance          Bypass S3 Object Lock GOVERNANCE mode retention for version purges
   --bypass-mutation-ceiling    Bypass relative bucket mutation ceiling safety check (default <= 5%)
+  --max-blast-radius <pct>     Maximum deletion percentage for sovereign operator (default: 5)
+  --canary-count <n>           Number of canary items to dispatch in canary phase (default: 5)
   --no-canary                  Skip pre-flight canary verification probe
   --max-deletion-percent <pct> Custom relative mutation ceiling percentage (e.g. 10 for 10%, default: 5)
   --acknowledge-replication-divergence Acknowledge replica divergence on buckets with active replication
@@ -200,8 +207,8 @@ OPTIONS:
   --min-waste-usd <amount>     Filter buckets below monthly waste threshold (USD)
   --exclude-bucket <patterns>  Comma-separated bucket name substrings/globs to exclude
   --exclude-region <regions>   Comma-separated AWS regions to exclude
-  --max-waste-usd <amount>     Exit code 1 if total monthly waste exceeds this USD amount
-  --fail-on-unprotected        Exit code 1 if any bucket has no active MPU lifecycle rule
+  --max-waste-usd <amount>     Exit code 3 if total monthly waste exceeds this USD amount
+  --fail-on-unprotected        Exit code 3 if any bucket has no active MPU lifecycle rule
   --format <fmt>               Output format: table|json|github for scan; terraform|cloudformation for remediate
   --json                       Shorthand for --format json
   --out-iac <path>             Write generated IaC code to a file instead of stdout
@@ -216,9 +223,12 @@ OPTIONS:
 
 EXIT CODES:
   0   Success, no policy violations
-  1   Policy threshold breached (--max-waste-usd or --fail-on-unprotected)
-  2   CLI argument / syntax error
-  3   Account discovery / authentication failure
+  1   CLI configuration, argument, or syntax error
+  2   Authentication or IAM authorization failure
+  3   Policy threshold breached, declarative policy violation, or unapproved drift
+  4   Circuit breaker open, canary gate failed, or blast radius ceiling breached
+  5   Filesystem or state store corruption / IO failure
+  6   Network timeout or connection refused
 
 SAFETY GUARANTEES:
   • 'scan', 'scan-versions', and 'plan' are 100% read-only.
@@ -761,6 +771,13 @@ export async function main(
   const log = io.stdout ?? console.log;
   const error = io.stderr ?? console.error;
 
+  // Ensure air-gapped enterprise CA certs are loaded into TLS root stores
+  try {
+    loadCustomCaCertificates();
+  } catch {
+    // Ignore CA loading error if file not found or invalid
+  }
+
   let parsed;
   try {
     parsed = parseArgs({
@@ -775,6 +792,8 @@ export async function main(
         confirm: { type: "boolean", default: false },
         "bypass-governance": { type: "boolean", default: false },
         "bypass-mutation-ceiling": { type: "boolean", default: false },
+        "max-blast-radius": { type: "string" },
+        "canary-count": { type: "string" },
         "no-canary": { type: "boolean", default: false },
         "max-deletion-percent": { type: "string" },
         "acknowledge-replication-divergence": { type: "boolean", default: false },
@@ -941,7 +960,89 @@ export async function main(
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  switch (command) {
+  try {
+    switch (command) {
+    // ── OPERATE: Autonomous Sovereign Operator ─────────────────────────────
+    case "operate": {
+      let maxBlastRadius = 5;
+      const blastRadiusStr = getString(values["max-blast-radius"]);
+      if (blastRadiusStr !== undefined) {
+        maxBlastRadius = parseFloat(blastRadiusStr);
+        if (isNaN(maxBlastRadius) || maxBlastRadius < 0) {
+          error("Error: --max-blast-radius must be a non-negative number");
+          return EXIT_CODES.CONFIG_ARG_ERROR;
+        }
+      }
+
+      let canaryCount = 5;
+      const canaryStr = getString(values["canary-count"]);
+      if (canaryStr !== undefined) {
+        canaryCount = parseInt(canaryStr, 10);
+        if (isNaN(canaryCount) || canaryCount < 0) {
+          error("Error: --canary-count must be a non-negative integer");
+          return EXIT_CODES.CONFIG_ARG_ERROR;
+        }
+      }
+
+      const s3Mirror = getString(values["s3-mirror"]);
+      const isDryRun = values["dry-run"] === true;
+      const isOnce = values.once === true;
+      const targetBucket = bucketArg;
+      const stateDirOpt = getString(values["state-dir"]) ?? path.resolve(process.cwd(), ".s3-guardian");
+
+      const s3Client = createS3Client(clientConfig);
+
+      const operator = new SovereignOperator({
+        intervalMs: daemonIntervalMs,
+        policyPath: policyFile,
+        maxBlastRadiusPercent: maxBlastRadius / 100,
+        canaryCount,
+        stateDir: stateDirOpt,
+        s3MirrorBucket: s3Mirror,
+        dryRun: isDryRun,
+        once: isOnce,
+        json: isJson,
+        targetBucket,
+        client: s3Client,
+        logger: log,
+        bypassGovernance: values["bypass-governance"] === true,
+        signal: io.signal,
+      });
+
+      if (isOnce) {
+        const context = await operator.runOnce();
+        if (context.isHalted) {
+          error(`\n❌ Sovereign Operator halted: ${context.haltReason ?? "safety check halted execution"}`);
+          const reason = (context.haltReason ?? "").toLowerCase();
+          if (
+            reason.includes("circuit breaker") ||
+            reason.includes("canary") ||
+            reason.includes("ceiling") ||
+            reason.includes("blast radius")
+          ) {
+            return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
+          }
+          if (context.lastError instanceof DiscoveryAuthError) {
+            return EXIT_CODES.AUTH_IAM_ERROR;
+          }
+          return EXIT_CODES.POLICY_VIOLATION;
+        }
+        return EXIT_CODES.SUCCESS;
+      } else {
+        try {
+          await operator.start();
+          return EXIT_CODES.SUCCESS;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`\n❌ Sovereign Operator error: ${msg}`);
+          if (err instanceof DiscoveryAuthError || /AccessDenied/i.test(msg)) {
+            return EXIT_CODES.AUTH_IAM_ERROR;
+          }
+          return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
+        }
+      }
+    }
+
     // ── SCAN & SCAN-VERSIONS ─────────────────────────────────────────────────
     case "scan":
     case "scan-versions": {
@@ -2510,27 +2611,27 @@ export async function main(
         for (const f of blastRadius.findings.filter((f) => f.risk === "CRITICAL_BLOCKED")) {
           error(`   ⛔ [${f.code}] ${f.message}`);
         }
-        return EXIT_CODES.POLICY_VIOLATION;
+        return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
       }
 
       if (blastRadius.requiresGovernanceBypass) {
         error(`\n❌ S3 Object Lock GOVERNANCE mode is active on bucket '${plan.bucket}'.`);
         error(`   Permanent version deletions require the '--bypass-governance' flag.`);
-        return EXIT_CODES.POLICY_VIOLATION;
+        return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
       }
 
       if (blastRadius.requiresReplicationAck) {
         error(`\n❌ Active replication (CRR/SRR) detected on bucket '${plan.bucket}'.`);
         error(`   Permanent version purges do NOT replicate across buckets, which will cause replica divergence.`);
         error(`   Pass '--acknowledge-replication-divergence' to proceed.`);
-        return EXIT_CODES.POLICY_VIOLATION;
+        return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
       }
 
       if (blastRadius.requiresWasabiEarlyDeleteBypass) {
         error(`\n❌ Wasabi 90-day retention guard triggered on bucket '${plan.bucket}':`);
         error(`   ⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees.`);
         error(`   Pass '--force-wasabi-early-delete' to proceed.`);
-        return EXIT_CODES.POLICY_VIOLATION;
+        return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
       }
 
       const unacknowledgedHigh = blastRadius.findings.filter((f) => f.risk === "HIGH");
@@ -2539,7 +2640,7 @@ export async function main(
         for (const f of unacknowledgedHigh) {
           error(`   ⚠️  [${f.code}] ${f.message}`);
         }
-        return EXIT_CODES.POLICY_VIOLATION;
+        return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
       }
 
       let hadErrors = false;
@@ -2572,7 +2673,7 @@ export async function main(
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           error(`\n❌ Execution error: ${msg}`);
-          return EXIT_CODES.POLICY_VIOLATION;
+          return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
         }
 
         log("\nMultipart Upload cleanup summary:");
@@ -2679,7 +2780,7 @@ export async function main(
           if (auditWriter) await auditWriter.close().catch(() => {});
           const msg = err instanceof Error ? err.message : String(err);
           error(`\n❌ Execution error: ${msg}`);
-          return EXIT_CODES.POLICY_VIOLATION;
+          return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
         }
 
         log("\nVersion Deletion summary:");
@@ -2746,7 +2847,7 @@ export async function main(
       }
 
       if (hadErrors) {
-        return EXIT_CODES.POLICY_VIOLATION;
+        return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
       }
 
       log("\n✅ Done! Cleanup completed successfully.");
@@ -3552,19 +3653,83 @@ export async function main(
       return EXIT_CODES.ARG_ERROR;
     }
   }
+} catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const code = (err as any)?.code || "";
+    const name = err instanceof Error ? err.name : "";
+    error(`\n❌ Fatal Error: ${msg}`);
+
+    if (
+      err instanceof DiscoveryAuthError ||
+      err instanceof OrganizationsDiscoveryError ||
+      name === "AccessDenied" ||
+      name === "UnauthorizedOperation" ||
+      /access denied|unauthorized|expired token|invalid security token/i.test(msg)
+    ) {
+      return EXIT_CODES.AUTH_IAM_ERROR;
+    }
+
+    if (
+      err instanceof CanaryVerificationError ||
+      name === "CanaryVerificationError" ||
+      /circuit breaker|mutation ceiling|canary/i.test(msg)
+    ) {
+      return EXIT_CODES.CIRCUIT_CANARY_BLAST_RADIUS;
+    }
+
+    if (
+      code === "ENOENT" ||
+      code === "EACCES" ||
+      code === "EPERM" ||
+      code === "EISDIR" ||
+      code === "EBADF" ||
+      /corrupt|checksum mismatch|tamper/i.test(msg)
+    ) {
+      return EXIT_CODES.FS_STATE_ERROR;
+    }
+
+    if (
+      code === "ETIMEDOUT" ||
+      code === "ECONNREFUSED" ||
+      code === "ENOTFOUND" ||
+      code === "EAI_AGAIN" ||
+      name === "TimeoutError" ||
+      /timeout|timed out|socket hang up|connection refused/i.test(msg)
+    ) {
+      return EXIT_CODES.NETWORK_TIMEOUT;
+    }
+
+    return EXIT_CODES.CONFIG_ARG_ERROR;
+  }
 }
 
 // Auto-run when executed directly
+const runningInSea = (() => {
+  try {
+    return isSea();
+  } catch {
+    return false;
+  }
+})();
+
 if (
-  process.argv[1] &&
-  (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("cli.ts"))
+  runningInSea ||
+  (process.argv[1] &&
+    (process.argv[1].endsWith("cli.js") ||
+      process.argv[1].endsWith("cli.ts") ||
+      process.argv[1].endsWith("bundle.cjs") ||
+      process.argv[1].endsWith("s3-guardian") ||
+      process.argv[1].endsWith("s3-guardian.exe")))
 ) {
-  main().then((exitCode) => {
-    if (exitCode !== 0) {
-      process.exit(exitCode);
-    }
-  }).catch((err) => {
-    console.error("Fatal error:", err?.message || err);
-    process.exit(EXIT_CODES.ARG_ERROR);
-  });
+  const cliArgs = runningInSea ? process.argv.slice(1) : process.argv.slice(2);
+  main(cliArgs)
+    .then((exitCode) => {
+      if (exitCode !== 0) {
+        process.exit(exitCode);
+      }
+    })
+    .catch((err) => {
+      console.error("Fatal error:", err?.message || err);
+      process.exit(EXIT_CODES.CONFIG_ARG_ERROR);
+    });
 }

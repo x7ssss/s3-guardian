@@ -1,7 +1,8 @@
 export type MutationType =
   | "LIFECYCLE_CONFIGURATION"
   | "BUCKET_TAGGING"
-  | "SOFT_DELETE_MARKER";
+  | "SOFT_DELETE_MARKER"
+  | "OBJECT_DELETION";
 
 export type InverseCommandType =
   | "PutBucketLifecycleConfiguration"

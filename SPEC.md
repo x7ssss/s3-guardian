@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.9.0  
+**Version:** 2.0.0 (General Availability)  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -674,3 +674,65 @@ If any matching policy or rule specifies `MONITOR_ONLY`, all automated and manua
 - **`s3-guardian policy plan <bucket> --policy <file> [--out <file>] [--json]`:** Resolves bucket tags, hierarchy precedence, leaf merges, and outputs compiled PutBucketLifecycleConfiguration JSON preview.
 - **`s3-guardian policy apply <bucket> --policy <file> --confirm [--state-dir <path>] [--json]`:** Captures pre-state, applies compiled configuration to AWS S3, and writes an immutable `UndoManifest` for rollback.
 - **`s3-guardian scan --all-buckets --policy <file>`:** Audits declarative storage policy compliance across all discovered fleet buckets.
+
+---
+
+## 18. Phase 19: The Autonomous Sovereign Operator & v2.0.0 General Availability
+
+Phase 19 delivers the pinnacle milestone for `s3-guardian`: continuous, fully autonomous storage governance with cryptographic rollback guarantees, air-gapped enterprise CA support, standalone single executable distribution, and a strict SemVer 2.0 exit code taxonomy.
+
+### 18.1 9-Phase Sovereign Operator State Machine
+
+The `SovereignOperator` engine (`s3-guardian operate`) unites all scanning, planning, safety verification, execution, and rollback capabilities into an in-process, non-terminating daemon executing across 9 discrete phases:
+
+```
+[DISCOVERY] ──▶ [POLICY_MATCH] ──▶ [BLAST_RADIUS_AUDIT] ──▶ [CANARY_TEST]
+                                                                  │
+      ┌───────────────────────────────────────────────────────────┘
+      ▼
+[CIRCUIT_VERIFY] ──▶ [BULK_EXECUTE] ──▶ [AUDIT_LOG] ──▶ [UNDO_EXPORT]
+                                                              │
+      ┌───────────────────────────────────────────────────────┘
+      ▼
+   [SLEEP] ──(interval elapsed)──▶ [DISCOVERY]
+```
+
+1. **DISCOVERY:** Paginates target accounts and buckets with cursor resumption. Emits candidate mutation targets.
+2. **POLICY_MATCH:** Evaluates discovered inventory against declarative policy rules (v1.9.0 engine). Excludes items matching `MONITOR_ONLY` or compliant configurations.
+3. **BLAST_RADIUS_AUDIT:** Pre-flight simulator enforces relative bucket mutation ceilings ($\le 5\%$), blocks buckets with S3 Object Lock in `COMPLIANCE` mode, and verifies replication configuration (`CRR`/`SRR`).
+4. **CANARY_TEST:** Dispatches isolated canary aborts/deletions against oldest candidate targets with post-action `HeadObject` probe verification.
+5. **CIRCUIT_VERIFY:** Queries moving error rates from the zero-allocation `CircuitBreaker`. If `OPEN`, halts execution and trips safety state.
+6. **BULK_EXECUTE:** Drains remaining mutation queue using bounded concurrency worker pool (`createConcurrencyLimiter`).
+7. **AUDIT_LOG:** Appends atomic JSONL audit records into local `.s3-guardian/audit.jsonl` with optional remote S3 mirroring.
+8. **UNDO_EXPORT:** Computes RFC 8785 canonical hashes and generates immutable `UndoManifest` and SOC 2 / ISO 27001 `DeletionCertificate` JSON files on disk.
+9. **SLEEP:** Measures epoch execution duration via monotonic timers (`process.hrtime.bigint()`), deducts elapsed execution time from the configured interval, and sleeps interruptibly via `AbortSignal`. Resets half-open probes upon healthy cycle completion.
+10. **HALTED:** Explicit terminal safe-state entered whenever blast radius, Object Lock, canary gates, or circuit breakers trip. Prevents destructive churn during infrastructure anomalies.
+
+### 18.2 Air-Gapped Trust Stores (`NODE_EXTRA_CA_CERTS`)
+
+In air-gapped data centers, sovereign enclaves, and corporate proxy architectures, TLS inspection requires custom internal Root Certificate Authorities:
+- **Environment Detection:** Automatically detects `NODE_EXTRA_CA_CERTS` on CLI startup.
+- **PEM Extraction:** Reads and parses concatenated X.509 PEM certificates from disk using regex boundary matching (`-----BEGIN CERTIFICATE-----` to `-----END CERTIFICATE-----`).
+- **Dynamic Context Injection:** Patches `tls.createSecureContext` dynamically to inject custom enterprise root certificates into all outbound TLS handshakes across AWS SDK v3 client pools and Node HTTPS agents.
+
+### 18.3 Single Executable Application (SEA) Architecture
+
+To eliminate runtime installation barriers (Node.js, npm, package managers), `s3-guardian` compiles into a standalone binary:
+- **Bundling:** `esbuild` compiles `src/cli.ts` into a single CommonJS bundle (`dist/bundle.cjs`) in $<300\text{ms}$.
+- **Blob Preparation:** Generates `dist/sea-prep.blob` via Node's native SEA preparation mechanism (`sea-config.json`).
+- **Binary Injection:** Uses `postject` to fuse the SEA blob directly into the Node binary with sentinel fuse `NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2`.
+- **Multi-Platform Matrix CI:** GitHub Actions compiles native binaries for `linux-x64`, `linux-arm64`, `macos-x64`, `macos-arm64`, and `windows-x64` with SHA-256 checksum verification (`SHA256SUMS`).
+
+### 18.4 SemVer 2.0 Exit Code Contract Taxonomy
+
+`s3-guardian v2.0.0` establishes a strict, stable exit code specification across all commands and automation:
+
+| Code | Symbol | Trigger Condition |
+| :--- | :--- | :--- |
+| `0` | `SUCCESS` | Clean scan, plan generated, apply completed, or policies fully satisfied |
+| `1` | `CONFIG_ARG_ERROR` | CLI configuration, syntax, or argument error; missing required parameters |
+| `2` | `AUTH_IAM_ERROR` | Authentication failure, IAM AccessDenied, Organizations discovery failure, or STS AssumeRole rejection |
+| `3` | `POLICY_VIOLATION` | Declarative policy violation, validation invariant breach, `--max-waste-usd` exceeded, or unapproved IaC drift |
+| `4` | `CIRCUIT_CANARY_BLAST_RADIUS` | Circuit breaker tripped (OPEN), canary probe failure, blast radius ceiling breach, or Wasabi 90-day retention guard triggered |
+| `5` | `FS_STATE_ERROR` | Filesystem or state store corruption, unreadable state file, or disk I/O error |
+| `6` | `NETWORK_TIMEOUT` | Network connection refused, DNS timeout, socket timeout (`ETIMEDOUT`), or AWS SDK `TimeoutError` |

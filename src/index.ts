@@ -329,7 +329,21 @@ export {
   validatePolicy,
   resolveBucketPolicy,
   compileToLifecycleConfiguration,
+  evaluatePolicies,
 } from "./policy/index.js";
-
-
-
+export {
+  CircuitBreaker,
+  CircuitBreakerState,
+  CircuitBreakerOptions,
+  CircuitOperation,
+  BatchErrorItem,
+} from "./circuit/index.js";
+export {
+  SovereignOperator,
+  OperatorConfig,
+  OperatorState,
+  OperatorContext,
+  CandidateMutationTarget,
+  loadCustomCaCertificates,
+  getCustomCaCertificates,
+} from "./operator/index.js";

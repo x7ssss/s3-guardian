@@ -1,6 +1,6 @@
 {
   "name": "s3-guardian",
-  "version": "1.9.0",
+  "version": "2.0.0",
   "description": "Local-first zero-runtime-dependency CLI to scan, quantify, and safely clean up zombie S3 multipart uploads",
   "type": "module",
   "bin": {
@@ -11,7 +11,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "build:sea": "npm run build && node --experimental-sea-config sea-config.json",
+    "build:bundle": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/bundle.cjs",
+    "build:sea": "node scripts/build-sea.mjs",
     "prepublishOnly": "npm test && npm run build",
     "test": "vitest run",
     "test:live": "tsx scripts/live-e2e.ts",
@@ -37,6 +38,8 @@
   "devDependencies": {
     "@types/node": "^22.13.9",
     "aws-sdk-client-mock": "^4.1.0",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6",
     "tsx": "^4.23.15",
     "typescript": "^5.7.3",
     "vitest": "^3.0.7"

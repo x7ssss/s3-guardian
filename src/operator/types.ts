@@ -58,6 +58,8 @@ export interface OperatorConfig {
   signal?: AbortSignal;
   /** Bypass S3 Object Lock governance retention mode. */
   bypassGovernance?: boolean;
+  /** Custom age threshold in days for target violations. */
+  olderThanDays?: number;
 }
 
 /**

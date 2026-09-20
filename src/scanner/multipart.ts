@@ -171,7 +171,7 @@ export async function* scanMultipartUploadsStream(
         upload.Key &&
         upload.UploadId &&
         upload.Initiated &&
-        upload.Initiated.getTime() < cutoffTime
+        (olderThanDays === 0 || upload.Initiated.getTime() <= cutoffTime)
       ) {
         yield {
           key: upload.Key,

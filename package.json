@@ -16,6 +16,7 @@
     "prepublishOnly": "npm test && npm run build",
     "test": "vitest run",
     "test:live": "tsx scripts/live-e2e.ts",
+    "test:enterprise": "tsx scripts/enterprise-e2e.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "start": "node ./dist/cli.js"

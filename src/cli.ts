@@ -1006,6 +1006,7 @@ export async function main(
         client: s3Client,
         logger: log,
         bypassGovernance: values["bypass-governance"] === true,
+        olderThanDays: argv.includes("--older-than") ? olderThanDays : undefined,
         signal: io.signal,
       });
 
@@ -3721,7 +3722,17 @@ if (
       process.argv[1].endsWith("s3-guardian") ||
       process.argv[1].endsWith("s3-guardian.exe")))
 ) {
-  const cliArgs = runningInSea ? process.argv.slice(1) : process.argv.slice(2);
+  const isExecutableOrScript =
+    Boolean(
+      process.argv[1] &&
+        (process.argv[1].endsWith(".exe") ||
+          process.argv[1].endsWith(".js") ||
+          process.argv[1].endsWith(".ts") ||
+          process.argv[1].endsWith(".cjs") ||
+          process.argv[1].endsWith("s3-guardian") ||
+          process.argv[1] === process.argv[0])
+    );
+  const cliArgs = isExecutableOrScript ? process.argv.slice(2) : process.argv.slice(1);
   main(cliArgs)
     .then((exitCode) => {
       if (exitCode !== 0) {

@@ -90,6 +90,7 @@ export class SovereignOperator {
       once: config.once ?? false,
       signal: config.signal,
       bypassGovernance: config.bypassGovernance ?? false,
+      olderThanDays: config.olderThanDays,
     };
 
     // Load any enterprise custom CA certificates into Node TLS context
@@ -217,6 +218,35 @@ export class SovereignOperator {
           });
         }
 
+        // Scan object versions (noncurrent versions and expired delete markers)
+        try {
+          const versionResult = await scanObjectVersions(this.client, bucketName, { olderThanDays: 0 });
+          for (const item of versionResult.noncurrentVersions) {
+            this.context.discoveredTargets.push({
+              bucket: bucketName,
+              key: item.key,
+              versionId: item.versionId,
+              size: item.size,
+              bytes: item.size,
+              lastModified: item.lastModified,
+              reason: "NONCURRENT_VERSION",
+            });
+          }
+          for (const item of versionResult.expiredDeleteMarkers) {
+            this.context.discoveredTargets.push({
+              bucket: bucketName,
+              key: item.key,
+              versionId: item.versionId,
+              size: 0,
+              bytes: 0,
+              lastModified: item.lastModified,
+              reason: "EXPIRED_DELETE_MARKER",
+            });
+          }
+        } catch {
+          // Ignore if bucket does not have versioning or lacks permissions
+        }
+
         this.context.discoveredBuckets.push({
           bucket: bucketName,
           region,
@@ -293,8 +323,8 @@ export class SovereignOperator {
         tags,
       };
 
-      let mpuAbortDays = 7;
-      let noncurrentExpirationDays = 30;
+      let mpuAbortDays = this.config.olderThanDays ?? 7;
+      let noncurrentExpirationDays = this.config.olderThanDays ?? 30;
       let actionMode: "MONITOR_ONLY" | "PLAN_ONLY" | "AUTO_REMEDIATE" = "AUTO_REMEDIATE";
 
       if (this.context.policies.length > 0) {
@@ -326,6 +356,8 @@ export class SovereignOperator {
           if (ageDays >= mpuAbortDays) {
             this.context.matchedViolations.push(target);
           }
+        } else if (target.reason === "EXPIRED_DELETE_MARKER") {
+          this.context.matchedViolations.push(target);
         } else if (target.versionId && target.lastModified) {
           const modifiedTime = new Date(target.lastModified).getTime();
           const ageDays = (now - modifiedTime) / (1000 * 60 * 60 * 24);
@@ -486,6 +518,11 @@ export class SovereignOperator {
         );
       } catch (err: unknown) {
         this.context.circuitBreaker.recordError(err);
+        this.context.circuitBreaker.trip(
+          `Canary gate verification failed on bucket '${bucket}': ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
         this.context.isHalted = true;
         this.context.lastError = err;
         this.context.haltReason = `Canary verification failure on '${bucket}': ${

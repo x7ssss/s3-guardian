@@ -6,6 +6,7 @@ import {
   ListPartsCommand,
   AbortMultipartUploadCommand,
   GetBucketLifecycleConfigurationCommand,
+  PutBucketLifecycleConfigurationCommand,
 } from "@aws-sdk/client-s3";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -55,7 +56,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.3.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.4.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -446,5 +447,105 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(code).toBe(0);
     const output = stdoutLogs.join("\n");
     expect(output).toContain("Cloudflare R2 detected");
+  });
+
+  it("scan outputs remediation tip when bucket has no lifecycle rule", async () => {
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      IsTruncated: false,
+      Uploads: [],
+    });
+    stubNoLifecycle();
+
+    const code = await main(["scan", "unprotected-bucket"], captureIO);
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("Run `s3-guardian remediate unprotected-bucket`");
+  });
+
+  it("plan outputs remediation tip when bucket has no lifecycle rule", async () => {
+    const tempFile = path.join(os.tmpdir(), `test-plan-tip-${Date.now()}.json`);
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      IsTruncated: false,
+      Uploads: [],
+    });
+    stubNoLifecycle();
+
+    try {
+      const code = await main(["plan", "tip-bucket", "--out", tempFile], captureIO);
+      expect(code).toBe(0);
+      const output = stdoutLogs.join("\n");
+      expect(output).toContain("Run `s3-guardian remediate tip-bucket`");
+    } finally {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+  });
+
+  it("remediate outputs Terraform snippet by default", async () => {
+    const code = await main(["remediate", "my-bucket"], captureIO);
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain('resource "aws_s3_bucket_lifecycle_configuration"');
+    expect(output).toContain('bucket = "my-bucket"');
+    expect(output).toContain("s3-guardian-abort-mpu");
+    expect(output).toContain("days_after_initiation = 7");
+  });
+
+  it("remediate outputs CloudFormation YAML with --format cloudformation", async () => {
+    const code = await main(
+      ["remediate", "my-bucket", "--format", "cloudformation", "--days", "14"],
+      captureIO
+    );
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("Type: AWS::S3::Bucket");
+    expect(output).toContain('BucketName: "my-bucket"');
+    expect(output).toContain("Id: s3-guardian-abort-mpu");
+    expect(output).toContain("DaysAfterInitiation: 14");
+  });
+
+  it("remediate saves IaC snippet to file with --out-iac", async () => {
+    const tempIacFile = path.join(os.tmpdir(), `remediate-${Date.now()}.tf`);
+    try {
+      const code = await main(
+        ["remediate", "my-bucket", "--out-iac", tempIacFile],
+        captureIO
+      );
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain(`saved to: ${tempIacFile}`);
+      const content = await fs.readFile(tempIacFile, "utf8");
+      expect(content).toContain('resource "aws_s3_bucket_lifecycle_configuration"');
+    } finally {
+      await fs.unlink(tempIacFile).catch(() => {});
+    }
+  });
+
+  it("remediate returns 2 if bucket is omitted and not --all-buckets", async () => {
+    const code = await main(["remediate"], captureIO);
+    expect(code).toBe(2);
+    expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'remediate'");
+  });
+
+  it("remediate executes direct API apply with --danger-direct-api-apply", async () => {
+    s3Mock
+      .on(GetBucketLifecycleConfigurationCommand, { Bucket: "api-remediate-bucket" })
+      .resolvesOnce({ Rules: [] });
+
+    s3Mock
+      .on(PutBucketLifecycleConfigurationCommand, { Bucket: "api-remediate-bucket" })
+      .resolvesOnce({});
+
+    const code = await main(
+      ["remediate", "api-remediate-bucket", "--danger-direct-api-apply", "--days", "5"],
+      captureIO
+    );
+
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("Direct API remediation complete for 'api-remediate-bucket'");
+    expect(output).toContain("DaysAfterInitiation: 5");
+
+    const putCalls = s3Mock.commandCalls(PutBucketLifecycleConfigurationCommand);
+    expect(putCalls.length).toBe(1);
+    expect(putCalls[0].args[0].input.Bucket).toBe("api-remediate-bucket");
   });
 });

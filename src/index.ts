@@ -68,5 +68,18 @@ export {
   PolicyViolation,
   PolicyEvaluationResult,
 } from "./policy/evaluator.js";
+export {
+  generateTerraformSnippet,
+  generateCloudFormationSnippet,
+  formatOrSaveIac,
+  IacFormat,
+  GenerateIacOptions,
+} from "./remediation/iac.js";
+export {
+  applyLifecycleRuleDirectly,
+  ApplyLifecycleResult,
+  DirectApplyOptions,
+  TARGET_RULE_ID,
+} from "./remediation/api.js";
 export { createConcurrencyLimiter, LimitFunction } from "./utils/concurrency.js";
 export { withRetry, isSlowDownError, RetryOptions } from "./utils/retry.js";

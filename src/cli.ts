@@ -9,8 +9,10 @@ import { auditBucketLifecycle, evaluateUploadCoverage } from "./lifecycle/audit.
 import { scanFleet, DiscoveryAuthError, FleetScanResult, BucketAuditResult } from "./fleet/scanner.js";
 import { evaluatePolicy, EXIT_CODES, PolicyOptions } from "./policy/evaluator.js";
 import { S3ClientPool } from "./discovery/client-pool.js";
+import { formatOrSaveIac, IacFormat } from "./remediation/iac.js";
+import { applyLifecycleRuleDirectly } from "./remediation/api.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads
@@ -21,6 +23,8 @@ USAGE:
   s3-guardian plan <bucket> --out <file> [options]
   s3-guardian plan --all-buckets --out <file> [options]
   s3-guardian apply --plan <file> --confirm [options]
+  s3-guardian remediate <bucket> [options]
+  s3-guardian remediate --all-buckets [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -28,6 +32,7 @@ COMMANDS:
   plan <bucket>           Generate an inspectable, deterministic JSON plan file
   plan --all-buckets      Generate a fleet-wide plan (summary JSON)
   apply                   Execute aborts defined in a plan file (requires --confirm)
+  remediate <bucket>      Generate IaC fix (Terraform / CloudFormation) or apply direct rule
 
 OPTIONS:
   --older-than <days>          Age threshold in days (default: 7)
@@ -38,13 +43,16 @@ OPTIONS:
   --force-path-style           Use S3 path-style addressing
   --region <region>            AWS Region (default: us-east-1 or AWS_REGION)
   --prefix <prefix>            Filter uploads by object key prefix
-  --all-buckets                Scan all buckets in the account (fleet mode)
+  --all-buckets                Scan / remediate all buckets in the account (fleet mode)
   --exclude-bucket <patterns>  Comma-separated bucket name substrings/globs to exclude
   --exclude-region <regions>   Comma-separated AWS regions to exclude
   --max-waste-usd <amount>     Exit code 1 if total monthly waste exceeds this USD amount
   --fail-on-unprotected        Exit code 1 if any bucket has no active MPU lifecycle rule
-  --format <table|json|github> Output format (default: table)
+  --format <fmt>               Output format: table|json|github for scan; terraform|cloudformation for remediate
   --json                       Shorthand for --format json
+  --out-iac <path>             Write generated IaC code to a file instead of stdout
+  --days <n>                   MPU age threshold in days for lifecycle rule (default: 7)
+  --danger-direct-api-apply    Directly apply lifecycle rule to S3 via API (bypasses GitOps)
   -h, --help                   Show this help message
   -v, --version                Show version
 
@@ -56,6 +64,8 @@ EXIT CODES:
 
 SAFETY GUARANTEES:
   • 'scan' and 'plan' are 100% read-only.
+  • 'remediate' defaults to generating deterministic IaC code (GitOps-first).
+  • Direct API mutation requires explicit '--danger-direct-api-apply' and preserves 100% of existing rules.
   • 'apply' strictly requires both a valid plan file and the '--confirm' flag.
   • Fleet mode: per-bucket failures (403, 404, RequesterPays) are isolated and never abort the full scan.
   • ListParts fan-out concurrency is capped at 10 to prevent 503 Slow Down rate-limits.
@@ -218,6 +228,9 @@ export async function main(
         "fail-on-unprotected": { type: "boolean", default: false },
         format: { type: "string", default: "table" },
         json: { type: "boolean", default: false },
+        "out-iac": { type: "string" },
+        days: { type: "string", default: "7" },
+        "danger-direct-api-apply": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -344,6 +357,14 @@ export async function main(
         log(``);
         renderFleetTable(fleetResult, log);
 
+        // Check if any bucket is unprotected or has ghost rules
+        const hasUnprotectedFleet = fleetResult.bucketResults.some(
+          (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || b.lifecycleAudit?.ghostRulesDetected?.length)
+        );
+        if (hasUnprotectedFleet) {
+          log(`\n💡 Tip: Run \`s3-guardian remediate --all-buckets\` to generate Terraform/CloudFormation fix.`);
+        }
+
         if (policyResult.violations.length > 0) {
           log(`\n❌ Policy violations detected:`);
           for (const v of policyResult.violations) {
@@ -397,9 +418,11 @@ export async function main(
         if (!lifecycleAudit.hasCoveringRule) {
           log(`    No valid (non-ghost) lifecycle rule covers multipart uploads.`);
         }
+        log(`\n💡 Tip: Run \`s3-guardian remediate ${bucketArg}\` to generate Terraform/CloudFormation fix.`);
       } else if (!lifecycleAudit.hasCoveringRule) {
         log(`\n[!] Bucket has NO lifecycle rule covering multipart uploads.`);
         log(`    Zombie uploads will accumulate indefinitely without manual cleanup.`);
+        log(`\n💡 Tip: Run \`s3-guardian remediate ${bucketArg}\` to generate Terraform/CloudFormation fix.`);
       }
 
       if (enrichedUploads.length === 0) {
@@ -507,6 +530,13 @@ export async function main(
         log(`  Total Stranded Storage:   ${formatBytes(fleetResult.totalStrandedBytes)}`);
         log(`  Estimated Monthly Waste:  ${formatMonthlyCost(fleetResult.totalEstimatedMonthlyWasteUSD)}`);
 
+        const hasUnprotectedFleet = fleetResult.bucketResults.some(
+          (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || b.lifecycleAudit?.ghostRulesDetected?.length)
+        );
+        if (hasUnprotectedFleet) {
+          log(`\n💡 Tip: Run \`s3-guardian remediate --all-buckets\` to generate Terraform/CloudFormation fix.`);
+        }
+
         if (policyResult.violations.length > 0) {
           log(`\n❌ Policy violations:`);
           for (const v of policyResult.violations) {
@@ -564,9 +594,13 @@ export async function main(
         log(`\nℹ️  Lifecycle Note: ${lifecycleAudit.providerNotes}`);
       } else if (!lifecycleAudit.hasCoveringRule) {
         log(`\n[!] Lifecycle Audit: Bucket has NO lifecycle rule covering multipart uploads.`);
+        log(`💡 Tip: Run \`s3-guardian remediate ${bucketArg}\` to generate Terraform/CloudFormation fix.`);
       }
       for (const ghost of lifecycleAudit.ghostRulesDetected) {
         log(`[!] Ghost Rule: ${ghost}`);
+      }
+      if (lifecycleAudit.ghostRulesDetected.length > 0 && lifecycleAudit.hasCoveringRule) {
+        log(`💡 Tip: Run \`s3-guardian remediate ${bucketArg}\` to generate Terraform/CloudFormation fix.`);
       }
 
       if (plan.highVolumeWarning) {
@@ -582,6 +616,159 @@ export async function main(
         log(`\nBucket is clean. No uploads scheduled for deletion.`);
       }
 
+      return EXIT_CODES.SUCCESS;
+    }
+
+    // ── REMEDIATE ─────────────────────────────────────────────────────────────
+    case "remediate": {
+      const daysStr = getString(values.days) ?? getString(values["older-than"]) ?? "7";
+      const days = parseInt(daysStr, 10);
+      if (isNaN(days) || days < 1) {
+        error("Error: --days must be a positive integer");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      const formatVal = getString(values.format)?.toLowerCase();
+      const iacFormat: IacFormat =
+        formatVal === "cloudformation" || formatVal === "cfn"
+          ? "cloudformation"
+          : "terraform";
+
+      const outIac = getString(values["out-iac"]);
+      const dangerDirect = values["danger-direct-api-apply"] === true;
+
+      // Fleet remediation
+      if (allBuckets) {
+        if (dangerDirect) {
+          log(`⚠️  Direct API Remediation: applying lifecycle rule across all account buckets...`);
+          const pool = new S3ClientPool();
+          try {
+            const discoveryClient = createS3Client(clientConfig);
+            const fleetResult = await scanFleet({
+              olderThanDays: days,
+              prefix,
+              excludeBuckets,
+              excludeRegions,
+              endpoint,
+              discoveryClient,
+              clientPool: pool,
+            });
+
+            const eligibleBuckets = fleetResult.bucketResults.filter(
+              (b) =>
+                b.status === "AUDITED" &&
+                (!b.lifecycleAudit?.hasCoveringRule ||
+                  (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
+            );
+
+            if (eligibleBuckets.length === 0) {
+              log(`✅ All audited buckets already have active, valid lifecycle rules.`);
+              return EXIT_CODES.SUCCESS;
+            }
+
+            log(`Found ${eligibleBuckets.length} bucket(s) requiring remediation.`);
+            let appliedCount = 0;
+            for (const b of eligibleBuckets) {
+              const bClient = pool.getClient(b.region ?? "us-east-1");
+              const res = await applyLifecycleRuleDirectly(bClient, b.bucket, days, {
+                dangerDirectApiApply: true,
+              });
+              appliedCount++;
+              log(`  [${appliedCount}/${eligibleBuckets.length}] Applied rule to '${b.bucket}' (${res.action}, total rules: ${res.totalRules})`);
+              if (res.ghostRuleWarning) {
+                log(`    ⚠️  ${res.ghostRuleWarning}`);
+              }
+            }
+            log(`\n✅ Direct API remediation applied to ${appliedCount} bucket(s).`);
+            return EXIT_CODES.SUCCESS;
+          } catch (err) {
+            if (err instanceof DiscoveryAuthError) {
+              error(`\n❌ Discovery failed: ${err.message}`);
+              return EXIT_CODES.DISCOVERY_AUTH_ERROR;
+            }
+            throw err;
+          } finally {
+            await pool.destroy();
+          }
+        } else {
+          // IaC generation for all buckets
+          log(`📝 Fleet Remediation: generating ${iacFormat.toUpperCase()} code for all account buckets...`);
+          const discoveryClient = createS3Client(clientConfig);
+          let allBucketsList: { Name?: string }[];
+          try {
+            const { ListBucketsCommand } = await import("@aws-sdk/client-s3");
+            const listResponse = await discoveryClient.send(new ListBucketsCommand({}));
+            allBucketsList = listResponse.Buckets ?? [];
+          } catch (err: unknown) {
+            error(`\n❌ Discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+            return EXIT_CODES.DISCOVERY_AUTH_ERROR;
+          }
+
+          let bucketNames = allBucketsList
+            .map((b) => b.Name)
+            .filter((n): n is string => Boolean(n));
+
+          if (excludeBuckets.length > 0) {
+            const { matchesExcludePattern } = await import("./fleet/scanner.js");
+            bucketNames = bucketNames.filter(
+              (name) => !matchesExcludePattern(name, excludeBuckets)
+            );
+          }
+
+          if (bucketNames.length === 0) {
+            log(`No matching buckets found to remediate.`);
+            return EXIT_CODES.SUCCESS;
+          }
+
+          const output = await formatOrSaveIac(bucketNames, {
+            format: iacFormat,
+            daysAfterInitiation: days,
+            outIac,
+          });
+
+          if (outIac) {
+            log(`\n✅ Generated ${iacFormat.toUpperCase()} configuration for ${bucketNames.length} bucket(s) saved to: ${outIac}`);
+          } else {
+            log(output);
+          }
+          return EXIT_CODES.SUCCESS;
+        }
+      }
+
+      // Single-bucket remediation
+      if (!bucketArg) {
+        error("Error: Bucket name is required for 'remediate'. Usage: s3-guardian remediate <bucket> [options]");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (dangerDirect) {
+        log(`⚠️  Executing direct API lifecycle policy update for bucket '${bucketArg}'...`);
+        const client = createS3Client(clientConfig);
+        const result = await applyLifecycleRuleDirectly(client, bucketArg, days, {
+          dangerDirectApiApply: true,
+        });
+
+        log(`\n✅ Direct API remediation complete for '${bucketArg}'.`);
+        log(`   Applied rule 's3-guardian-abort-mpu' (Status: Enabled, DaysAfterInitiation: ${days}).`);
+        log(`   Action: ${result.action} rule. Total active rules: ${result.totalRules} (preserved ${result.preservedRuleIds.length} existing rule(s)).`);
+        if (result.ghostRuleWarning) {
+          log(`   ⚠️  Warning: ${result.ghostRuleWarning}`);
+        }
+        return EXIT_CODES.SUCCESS;
+      }
+
+      // GitOps / IaC Mode (Default)
+      const output = await formatOrSaveIac(bucketArg, {
+        format: iacFormat,
+        daysAfterInitiation: days,
+        outIac,
+      });
+
+      if (outIac) {
+        log(`✅ Generated ${iacFormat.toUpperCase()} snippet saved to: ${outIac}`);
+      } else {
+        log(output);
+      }
       return EXIT_CODES.SUCCESS;
     }
 

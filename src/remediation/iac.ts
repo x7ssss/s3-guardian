@@ -1,12 +1,18 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
+export const DEFAULT_TRANSITION_MIN_SIZE_BYTES = 131072; // 128 KiB
+
 export type IacFormat = "terraform" | "cloudformation";
 
 export interface IacSnippetOptions {
   daysAfterInitiation?: number;
   includeVersioning?: boolean;
   noncurrentDays?: number;
+  includeTransitions?: boolean;
+  transitionDays?: number;
+  transitionStorageClass?: string;
+  filterMinSize?: number;
 }
 
 export interface GenerateIacOptions extends IacSnippetOptions {
@@ -14,20 +20,48 @@ export interface GenerateIacOptions extends IacSnippetOptions {
   outIac?: string;
 }
 
+export interface DangerousRuleRemediationInput {
+  ruleId?: string;
+  targetStorageClass?: string;
+  days?: number;
+  recommendedMinSize?: number;
+}
+
+interface ResolvedSnippetOptions {
+  daysAfterInitiation: number;
+  includeVersioning: boolean;
+  noncurrentDays: number;
+  includeTransitions: boolean;
+  transitionDays: number;
+  transitionStorageClass: string;
+  filterMinSize: number;
+}
+
 function resolveSnippetOptions(
   optionsOrDays: number | IacSnippetOptions = 7
-): Required<IacSnippetOptions> {
+): ResolvedSnippetOptions {
   if (typeof optionsOrDays === "number") {
     return {
       daysAfterInitiation: optionsOrDays,
       includeVersioning: false,
       noncurrentDays: 30,
+      includeTransitions: false,
+      transitionDays: 30,
+      transitionStorageClass: "GLACIER",
+      filterMinSize: DEFAULT_TRANSITION_MIN_SIZE_BYTES,
     };
   }
   return {
     daysAfterInitiation: optionsOrDays.daysAfterInitiation ?? 7,
     includeVersioning: optionsOrDays.includeVersioning ?? false,
     noncurrentDays: optionsOrDays.noncurrentDays ?? 30,
+    includeTransitions:
+      optionsOrDays.includeTransitions ??
+      (optionsOrDays.transitionDays !== undefined ||
+        optionsOrDays.transitionStorageClass !== undefined),
+    transitionDays: optionsOrDays.transitionDays ?? 30,
+    transitionStorageClass: optionsOrDays.transitionStorageClass ?? "GLACIER",
+    filterMinSize: optionsOrDays.filterMinSize ?? DEFAULT_TRANSITION_MIN_SIZE_BYTES,
   };
 }
 
@@ -39,13 +73,22 @@ function resolveSnippetOptions(
  *  - GitOps-first: emits deterministic, readable HCL snippet.
  *  - MalformedXML Prevention: ExpiredObjectDeleteMarker is isolated in a dedicated rule
  *    with an empty filter and NO Days/Date/Tag constraints.
+ *  - Small-Object Trap Prevention: Automatically injects `object_size_greater_than = 131072` (128 KiB)
+ *    inside transition rule filters.
  */
 export function generateTerraformSnippet(
   bucket: string,
   optionsOrDays: number | IacSnippetOptions = 7
 ): string {
-  const { daysAfterInitiation, includeVersioning, noncurrentDays } =
-    resolveSnippetOptions(optionsOrDays);
+  const {
+    daysAfterInitiation,
+    includeVersioning,
+    noncurrentDays,
+    includeTransitions,
+    transitionDays,
+    transitionStorageClass,
+    filterMinSize,
+  } = resolveSnippetOptions(optionsOrDays);
   const resourceName = `lifecycle_${bucket.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 
   let rulesHcl = `  rule {
@@ -84,6 +127,23 @@ export function generateTerraformSnippet(
   }`;
   }
 
+  if (includeTransitions) {
+    rulesHcl += `\n\n  # Safe transition rule: object_size_greater_than prevents Glacier small-object traps
+  rule {
+    id     = "s3-guardian-safe-transition"
+    status = "Enabled"
+
+    filter {
+      object_size_greater_than = ${filterMinSize}
+    }
+
+    transition {
+      days          = ${transitionDays}
+      storage_class = "${transitionStorageClass}"
+    }
+  }`;
+  }
+
   return `# Terraform (AWS Provider v4+) Lifecycle Configuration for '${bucket}'
 resource "aws_s3_bucket_lifecycle_configuration" "${resourceName}" {
   bucket = "${bucket}"
@@ -101,8 +161,15 @@ export function generateCloudFormationSnippet(
   bucket: string,
   optionsOrDays: number | IacSnippetOptions = 7
 ): string {
-  const { daysAfterInitiation, includeVersioning, noncurrentDays } =
-    resolveSnippetOptions(optionsOrDays);
+  const {
+    daysAfterInitiation,
+    includeVersioning,
+    noncurrentDays,
+    includeTransitions,
+    transitionDays,
+    transitionStorageClass,
+    filterMinSize,
+  } = resolveSnippetOptions(optionsOrDays);
 
   let rulesYaml = `        - Id: s3-guardian-abort-mpu
           Status: Enabled
@@ -119,6 +186,16 @@ export function generateCloudFormationSnippet(
           ExpiredObjectDeleteMarker: true`;
   }
 
+  if (includeTransitions) {
+    rulesYaml += `\n        - Id: s3-guardian-safe-transition
+          Status: Enabled
+          Filter:
+            ObjectSizeGreaterThan: ${filterMinSize}
+          Transitions:
+            - Days: ${transitionDays}
+              StorageClass: ${transitionStorageClass}`;
+  }
+
   return `# CloudFormation LifecycleConfiguration snippet for '${bucket}'
 Type: AWS::S3::Bucket
 Properties:
@@ -127,6 +204,110 @@ Properties:
     Rules:
 ${rulesYaml}
 `;
+}
+
+/**
+ * Dedicated remediation generator: Generates Terraform HCL to fix existing unconstrained
+ * transition rules by injecting `object_size_greater_than = 131072` (128 KiB).
+ */
+export function generateTerraformTransitionRemediation(
+  bucket: string,
+  rulesOrRule?: DangerousRuleRemediationInput[] | DangerousRuleRemediationInput
+): string {
+  const resourceName = `lifecycle_${bucket.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+  const rawRules = rulesOrRule
+    ? Array.isArray(rulesOrRule)
+      ? rulesOrRule
+      : [rulesOrRule]
+    : [{ ruleId: "s3-guardian-remediated-transition", targetStorageClass: "GLACIER", days: 30 }];
+
+  const ruleBlocks = rawRules
+    .map((r) => {
+      const ruleId = r.ruleId || "s3-guardian-remediated-transition";
+      const storageClass = r.targetStorageClass || "GLACIER";
+      const days = r.days ?? 30;
+      const minSize = r.recommendedMinSize ?? DEFAULT_TRANSITION_MIN_SIZE_BYTES;
+
+      return `  rule {
+    id     = "${ruleId}"
+    status = "Enabled"
+
+    filter {
+      object_size_greater_than = ${minSize}
+    }
+
+    transition {
+      days          = ${days}
+      storage_class = "${storageClass}"
+    }
+  }`;
+    })
+    .join("\n\n");
+
+  return `# Terraform Transition Remediation for '${bucket}'
+# Fixes Glacier / Infrequent Access small-object trap by injecting 128 KiB filter
+resource "aws_s3_bucket_lifecycle_configuration" "${resourceName}" {
+  bucket = "${bucket}"
+
+${ruleBlocks}
+}
+`;
+}
+
+/**
+ * Dedicated remediation generator: Generates CloudFormation YAML to fix existing unconstrained
+ * transition rules by injecting `ObjectSizeGreaterThan: 131072` (128 KiB).
+ */
+export function generateCloudFormationTransitionRemediation(
+  bucket: string,
+  rulesOrRule?: DangerousRuleRemediationInput[] | DangerousRuleRemediationInput
+): string {
+  const rawRules = rulesOrRule
+    ? Array.isArray(rulesOrRule)
+      ? rulesOrRule
+      : [rulesOrRule]
+    : [{ ruleId: "s3-guardian-remediated-transition", targetStorageClass: "GLACIER", days: 30 }];
+
+  const rulesYaml = rawRules
+    .map((r) => {
+      const ruleId = r.ruleId || "s3-guardian-remediated-transition";
+      const storageClass = r.targetStorageClass || "GLACIER";
+      const days = r.days ?? 30;
+      const minSize = r.recommendedMinSize ?? DEFAULT_TRANSITION_MIN_SIZE_BYTES;
+
+      return `        - Id: ${ruleId}
+          Status: Enabled
+          Filter:
+            ObjectSizeGreaterThan: ${minSize}
+          Transitions:
+            - Days: ${days}
+              StorageClass: ${storageClass}`;
+    })
+    .join("\n");
+
+  return `# CloudFormation Transition Remediation for '${bucket}'
+# Fixes Glacier / Infrequent Access small-object trap by injecting 128 KiB filter
+Type: AWS::S3::Bucket
+Properties:
+  BucketName: "${bucket}"
+  LifecycleConfiguration:
+    Rules:
+${rulesYaml}
+`;
+}
+
+/**
+ * Formats dedicated transition remediation snippet in either Terraform or CloudFormation.
+ */
+export function generateTransitionRemediationSnippet(
+  bucket: string,
+  rulesOrRule?: DangerousRuleRemediationInput[] | DangerousRuleRemediationInput,
+  format: IacFormat = "terraform"
+): string {
+  if (format === "cloudformation") {
+    return generateCloudFormationTransitionRemediation(bucket, rulesOrRule);
+  }
+  return generateTerraformTransitionRemediation(bucket, rulesOrRule);
 }
 
 /**

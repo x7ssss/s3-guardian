@@ -11,6 +11,10 @@ import { auditBucketLifecycle, LifecycleAuditResult } from "../lifecycle/audit.j
 import { calculateMonthlyCostUSD } from "../cost/estimator.js";
 import { createConcurrencyLimiter } from "../utils/concurrency.js";
 import { ZombieUploadItem } from "../planner/plan.js";
+import {
+  auditBucketTransitions,
+  BucketTransitionAuditResult,
+} from "../transitions/index.js";
 
 // ─── Error types ──────────────────────────────────────────────────────────────
 
@@ -50,6 +54,8 @@ export interface BucketAuditResult {
     LifecycleAuditResult,
     "bucketHasLifecyclePolicy" | "hasCoveringRule" | "ghostRulesDetected" | "providerNotes"
   >;
+  /** Results of lifecycle transition trap audit, if enabled */
+  transitionAudit?: BucketTransitionAuditResult;
   /** Error message when status === "ERROR" or a skip reason */
   errorMessage?: string;
 }
@@ -61,6 +67,7 @@ export interface FleetScanResult {
   totalZombieUploads: number;
   totalStrandedBytes: number;
   totalEstimatedMonthlyWasteUSD: number;
+  totalTransitionPenaltyUSD?: number;
   bucketResults: BucketAuditResult[];
 }
 
@@ -73,6 +80,8 @@ export interface FleetScanOptions {
   olderThanDays?: number;
   /** Key prefix filter passed to individual bucket scans */
   prefix?: string;
+  /** Whether to audit lifecycle transition rules for small-object traps */
+  auditTransitions?: boolean;
   /** Max concurrent bucket audits in flight (default: 5) */
   bucketConcurrency?: number;
   /** Comma-separated bucket name substrings or glob patterns to exclude */
@@ -205,6 +214,18 @@ async function auditOneBucket(
       return { ...u, lifecycleStatus: coverage.status };
     });
 
+    let transitionAudit: BucketTransitionAuditResult | undefined;
+    if (options.auditTransitions) {
+      try {
+        transitionAudit = await auditBucketTransitions(client, bucket, {
+          prefix: options.prefix,
+          retryOptions: options.retryOptions,
+        });
+      } catch {
+        // graceful best-effort transition audit
+      }
+    }
+
     return {
       bucket,
       region,
@@ -219,6 +240,7 @@ async function auditOneBucket(
         ghostRulesDetected: lifecycleAudit.ghostRulesDetected,
         providerNotes: lifecycleAudit.providerNotes,
       },
+      transitionAudit,
     };
   } catch (err: unknown) {
     const { isAccessDenied, isRequesterPays, isNotFound, message } =
@@ -412,12 +434,16 @@ export async function scanFleet(
   let totalStrandedBytes = 0;
   let bucketsAudited = 0;
   let bucketsSkipped = 0;
+  let totalTransitionPenaltyUSD = 0;
 
   for (const r of bucketResults) {
     if (r.status === "AUDITED") {
       bucketsAudited++;
       totalZombieUploads += r.totalZombieUploads ?? 0;
       totalStrandedBytes += r.totalStrandedBytes ?? 0;
+      if (r.transitionAudit) {
+        totalTransitionPenaltyUSD += r.transitionAudit.totalEstimatedPenaltyUSD;
+      }
     } else {
       bucketsSkipped++;
     }
@@ -432,6 +458,9 @@ export async function scanFleet(
     totalZombieUploads,
     totalStrandedBytes,
     totalEstimatedMonthlyWasteUSD,
+    totalTransitionPenaltyUSD: options.auditTransitions
+      ? Math.round(totalTransitionPenaltyUSD * 100) / 100
+      : undefined,
     bucketResults,
   };
 }

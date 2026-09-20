@@ -5,6 +5,9 @@ import * as os from "node:os";
 import {
   generateTerraformSnippet,
   generateCloudFormationSnippet,
+  generateTerraformTransitionRemediation,
+  generateCloudFormationTransitionRemediation,
+  generateTransitionRemediationSnippet,
   formatOrSaveIac,
 } from "../src/remediation/iac.js";
 
@@ -134,6 +137,84 @@ describe("IaC Remediation Generators", () => {
       const fileContent = await fs.readFile(targetFile, "utf8");
       expect(fileContent).toBe(output);
       expect(fileContent).toContain('bucket = "saved-bucket"');
+    });
+  });
+
+  describe("Lifecycle Transition Remediation & 128 KiB Filter Injection", () => {
+    it("automatically injects object_size_greater_than = 131072 in Terraform snippet when includeTransitions: true", () => {
+      const snippet = generateTerraformSnippet("transition-bucket", {
+        includeTransitions: true,
+        transitionDays: 30,
+        transitionStorageClass: "GLACIER",
+      });
+
+      expect(snippet).toContain("s3-guardian-safe-transition");
+      expect(snippet).toContain("object_size_greater_than = 131072");
+      expect(snippet).toContain("days          = 30");
+      expect(snippet).toContain('storage_class = "GLACIER"');
+    });
+
+    it("automatically injects ObjectSizeGreaterThan: 131072 in CloudFormation snippet when includeTransitions: true", () => {
+      const snippet = generateCloudFormationSnippet("cfn-transition-bucket", {
+        includeTransitions: true,
+        transitionDays: 60,
+        transitionStorageClass: "STANDARD_IA",
+      });
+
+      expect(snippet).toContain("- Id: s3-guardian-safe-transition");
+      expect(snippet).toContain("ObjectSizeGreaterThan: 131072");
+      expect(snippet).toContain("Days: 60");
+      expect(snippet).toContain("StorageClass: STANDARD_IA");
+    });
+
+    it("generates dedicated Terraform transition remediation for unconstrained rules", () => {
+      const snippet = generateTerraformTransitionRemediation("dangerous-bucket", [
+        {
+          ruleId: "unconstrained-glacier",
+          targetStorageClass: "GLACIER",
+          days: 30,
+          recommendedMinSize: 131072,
+        },
+      ]);
+
+      expect(snippet).toContain('resource "aws_s3_bucket_lifecycle_configuration"');
+      expect(snippet).toContain('id     = "unconstrained-glacier"');
+      expect(snippet).toContain("object_size_greater_than = 131072");
+      expect(snippet).toContain("days          = 30");
+      expect(snippet).toContain('storage_class = "GLACIER"');
+    });
+
+    it("generates dedicated CloudFormation transition remediation for unconstrained rules", () => {
+      const snippet = generateCloudFormationTransitionRemediation("cfn-dangerous-bucket", [
+        {
+          ruleId: "trap-ia-rule",
+          targetStorageClass: "STANDARD_IA",
+          days: 45,
+          recommendedMinSize: 131072,
+        },
+      ]);
+
+      expect(snippet).toContain("Type: AWS::S3::Bucket");
+      expect(snippet).toContain("- Id: trap-ia-rule");
+      expect(snippet).toContain("ObjectSizeGreaterThan: 131072");
+      expect(snippet).toContain("Days: 45");
+      expect(snippet).toContain("StorageClass: STANDARD_IA");
+    });
+
+    it("formats transition remediation snippet with generateTransitionRemediationSnippet()", () => {
+      const tfSnippet = generateTransitionRemediationSnippet("bucket-a", {
+        ruleId: "my-rule",
+        targetStorageClass: "GLACIER",
+        days: 30,
+      }, "terraform");
+      expect(tfSnippet).toContain("object_size_greater_than = 131072");
+
+      const cfnSnippet = generateTransitionRemediationSnippet("bucket-b", {
+        ruleId: "my-rule",
+        targetStorageClass: "DEEP_ARCHIVE",
+        days: 90,
+      }, "cloudformation");
+      expect(cfnSnippet).toContain("ObjectSizeGreaterThan: 131072");
     });
   });
 });

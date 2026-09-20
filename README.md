@@ -1,11 +1,11 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.0.1-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.1.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
 
-Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned multipart uploads, noncurrent object versions, and expired delete markers across AWS S3 and S3-compatible object stores (Cloudflare R2, MinIO).
+Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned multipart uploads, noncurrent object versions, and lifecycle transition traps across AWS S3 and S3-compatible object stores (Cloudflare R2, MinIO).
 
 ---
 
@@ -54,6 +54,8 @@ Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned 
    Version-enabled buckets silently accumulate millions of noncurrent versions and Expired Object Delete Markers (EODMs), degrading listing latency and accumulating immense financial waste.
 3. **Drift-Prone Direct API Mutations:**
    Blindly overwriting S3 lifecycle rules with manual API calls destroys existing Terraform and CloudFormation state. `s3-guardian` is **GitOps-first**, generating clean IaC code by default.
+4. **Glacier & Standard-IA Small-Object Transition Traps:**
+   S3 Standard-IA, One Zone-IA, and Glacier Instant Retrieval (GIR) enforce a 128 KiB minimum billable size floor. Glacier Flexible Retrieval (GFR) and Deep Archive (GDA) charge 40 KiB metadata overhead per object (8 KiB at Standard rate + 32 KiB at Glacier rate). Unconstrained transition rules lacking `ObjectSizeGreaterThan` filters force sub-128 KiB objects into archive tiers, increasing ongoing monthly storage costs up to 70x and charging $0.01–$0.05/1k transition request fees.
 
 ---
 
@@ -210,6 +212,33 @@ s3-guardian lens ./storage-lens-export.csv --top 10
 s3-guardian lens s3://audit-bucket/StorageLens/report.csv --min-waste-usd 50.00
 ```
 
+### 6. `audit-transitions`: Lifecycle Transition Trap Auditor
+
+Audits S3 lifecycle configuration rules for dangerous unconstrained transitions targeting Infrequent Access or Glacier classes without a 128 KiB minimum size filter:
+
+```bash
+# Audit a single bucket's lifecycle transition rules
+s3-guardian audit-transitions my-data-bucket
+
+# Audit all buckets across the account
+s3-guardian audit-transitions --all-buckets
+
+# Include transition audit during standard scan
+s3-guardian scan my-data-bucket --audit-transitions
+
+# Machine-readable JSON output
+s3-guardian audit-transitions my-data-bucket --json
+```
+
+Terminal Output Table:
+```
+Rule ID                     Target Tier     Days    Min Size Filter     Small-Object Risk   Est. Penalty/Mo   Status
+-------------------------------------------------------------------------------------------------------------------------
+archive-raw-telemetry       GLACIER         30      None (0 B)          HIGH (< 128 KiB)    $42.50/mo         TRAP DETECTED
+```
+
+Actionable remediation snippets with `object_size_greater_than = 131072` (128 KiB) are automatically emitted to remediate the small-object trap.
+
 ---
 
 ## Full CLI Reference
@@ -218,6 +247,7 @@ s3-guardian lens s3://audit-bucket/StorageLens/report.csv --min-waste-usd 50.00
 | :--- | :--- | :--- | :--- |
 | `--older-than <days>` | number | `7` | Age threshold in days for multipart uploads and versions |
 | `--include-versions` | flag | `false` | Scan and plan for noncurrent versions and expired delete markers |
+| `--audit-transitions` | flag | `false` | Audit lifecycle transitions for Glacier/IA small-object traps during scan |
 | `--out <file>` | string | `plan.json` | Destination path for plan output file |
 | `--plan <file>` | string | — | Path to plan file to execute |
 | `--confirm` | flag | `false` | Explicit confirmation required for destructive apply |

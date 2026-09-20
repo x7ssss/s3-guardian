@@ -89,10 +89,15 @@ export {
 export {
   generateTerraformSnippet,
   generateCloudFormationSnippet,
+  generateTerraformTransitionRemediation,
+  generateCloudFormationTransitionRemediation,
+  generateTransitionRemediationSnippet,
   formatOrSaveIac,
   IacFormat,
   GenerateIacOptions,
   IacSnippetOptions,
+  DangerousRuleRemediationInput,
+  DEFAULT_TRANSITION_MIN_SIZE_BYTES,
 } from "./remediation/iac.js";
 export {
   applyLifecycleRuleDirectly,
@@ -180,4 +185,27 @@ export {
   readStorageLensMetrics,
   ReadStorageLensOptions,
 } from "./lens/reader.js";
+export {
+  calculateTransitionCostDelta,
+  auditBucketTransitions,
+  getStorageClassConfig,
+  normalizeStorageClass,
+  extractRuleMinSizeFilter,
+  isIaOrGlacierClass,
+  BYTES_PER_KIB,
+  MIN_BILLABLE_SIZE_128KIB,
+  METADATA_OVERHEAD_STANDARD_BYTES,
+  METADATA_OVERHEAD_GLACIER_BYTES,
+  METADATA_OVERHEAD_TOTAL_BYTES,
+  TRANSITION_FEE_PER_1K_IA,
+  TRANSITION_FEE_PER_1K_GLACIER,
+  RECOMMENDED_MIN_TRANSITION_SIZE_BYTES,
+  DangerousTransitionRule,
+  TransitionAuditOptions,
+  BucketTransitionAuditResult,
+  TransitionCostParams,
+  TransitionCostResult,
+  MetadataOverheadBreakdown,
+  StorageClassConfig,
+} from "./transitions/index.js";
 

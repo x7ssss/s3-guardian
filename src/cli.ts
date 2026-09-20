@@ -34,11 +34,23 @@ import {
 } from "./multi-account/runner.js";
 import { readStorageLensMetrics } from "./lens/reader.js";
 import { StorageLensBucketMetrics } from "./lens/scorer.js";
+import {
+  auditBucketTransitions,
+  BucketTransitionAuditResult,
+  DangerousTransitionRule,
+} from "./transitions/index.js";
+import {
+  generateTerraformTransitionRemediation,
+  generateCloudFormationTransitionRemediation,
+} from "./remediation/iac.js";
+import { ListBucketsCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3";
+import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
+import { matchesExcludePattern } from "./fleet/scanner.js";
 
-const VERSION = "1.0.1";
+const VERSION = "1.1.0";
 
 const HELP_TEXT = `
-s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioning waste
+s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning waste, and transition traps
 
 USAGE:
   s3-guardian scan <bucket> [options]
@@ -47,6 +59,8 @@ USAGE:
   s3-guardian scan --accounts <id,id,...> [options]
   s3-guardian scan-versions <bucket> [options]
   s3-guardian scan-versions --org [options]
+  s3-guardian audit-transitions <bucket> [options]
+  s3-guardian audit-transitions --all-buckets [options]
   s3-guardian plan <bucket> --out <file> [options]
   s3-guardian plan --all-buckets --out <file> [options]
   s3-guardian plan --org --out <file> [options]
@@ -60,6 +74,7 @@ COMMANDS:
   scan --all-buckets      Read-only fleet scan across all account buckets
   scan --org              Multi-account sweep across AWS Organizations accounts
   scan-versions <bucket>  Scan for noncurrent object versions and expired delete markers
+  audit-transitions <bucket> Audit lifecycle rules for Glacier/IA small-object transition traps
   plan <bucket>           Generate an inspectable, deterministic JSON plan file (RFC 8785 verified)
   plan --all-buckets      Generate a fleet-wide plan (summary JSON)
   plan --org              Generate a multi-account organization plan (summary JSON)
@@ -70,6 +85,7 @@ COMMANDS:
 OPTIONS:
   --older-than <days>          Age threshold in days (default: 7)
   --include-versions           Scan and plan for noncurrent versions and expired delete markers
+  --audit-transitions          Audit lifecycle transitions for Glacier/IA small-object traps during scan
   --out <file>                 Output path for plan file (default: plan.json)
   --plan <file>                Plan file to apply
   --confirm                    Explicit confirmation required to execute apply deletions
@@ -461,6 +477,96 @@ function renderLensTable(
   }
 }
 
+function renderTransitionTable(
+  auditResult: BucketTransitionAuditResult,
+  log: (msg: string) => void
+): void {
+  if (auditResult.dangerousRules.length === 0) {
+    log(`✅ Clean! All transition rules in '${auditResult.bucketName}' have safe size filters (>= 128 KiB).`);
+    return;
+  }
+
+  log(`\nFound ${auditResult.dangerousRules.length} unconstrained or dangerous transition rule(s) in '${auditResult.bucketName}':\n`);
+
+  const padRuleId = 28;
+  const padTier = 16;
+  const padDays = 8;
+  const padMinSize = 20;
+  const padRisk = 20;
+  const padPenalty = 18;
+  const padStatus = 16;
+
+  log(
+    "Rule ID".padEnd(padRuleId) +
+    "Target Tier".padEnd(padTier) +
+    "Days".padEnd(padDays) +
+    "Min Size Filter".padEnd(padMinSize) +
+    "Small-Object Risk".padEnd(padRisk) +
+    "Est. Penalty/Mo".padEnd(padPenalty) +
+    "Status".padEnd(padStatus)
+  );
+  log(
+    "-".repeat(
+      padRuleId + padTier + padDays + padMinSize + padRisk + padPenalty + padStatus
+    )
+  );
+
+  for (const r of auditResult.dangerousRules) {
+    const shortId =
+      r.ruleId.length > padRuleId - 3
+        ? r.ruleId.slice(0, padRuleId - 3) + "..."
+        : r.ruleId;
+    const tier = r.targetStorageClass;
+    const daysStr = String(r.days);
+    const minSizeStr =
+      r.currentFilterMinSize !== undefined
+        ? formatBytes(r.currentFilterMinSize)
+        : "None (0 B)";
+    const riskStr =
+      r.currentFilterMinSize === undefined || r.currentFilterMinSize < 131072
+        ? "HIGH (< 128 KiB)"
+        : "NONE (>= 128 KiB)";
+    const penaltyStr = formatMonthlyCost(r.estimatedPenaltyUSD);
+    const statusStr = r.estimatedPenaltyUSD > 0 ? "TRAP DETECTED" : "DANGEROUS";
+
+    log(
+      shortId.padEnd(padRuleId) +
+      tier.padEnd(padTier) +
+      daysStr.padEnd(padDays) +
+      minSizeStr.padEnd(padMinSize) +
+      riskStr.padEnd(padRisk) +
+      penaltyStr.padEnd(padPenalty) +
+      statusStr.padEnd(padStatus)
+    );
+  }
+
+  if (auditResult.totalEstimatedPenaltyUSD > 0) {
+    log(
+      `\n⚠️  Total Projected Monthly Penalty: ${formatMonthlyCost(
+        auditResult.totalEstimatedPenaltyUSD
+      )}`
+    );
+  }
+
+  log(`\n💡 Actionable Tip: Small-object transition traps detected!`);
+  log(
+    `   Transitioning objects < 128 KiB to ${
+      auditResult.dangerousRules[0]?.targetStorageClass || "Glacier"
+    } increases storage costs due to 128 KiB floor / 40 KiB metadata overhead.`
+  );
+  log(
+    `   Inject \`object_size_greater_than = 131072\` (128 KiB) to protect small objects from transition traps.\n`
+  );
+  log(`   Recommended Terraform Fix:`);
+  log(`   ---------------------------`);
+  log(
+    generateTerraformTransitionRemediation(
+      auditResult.bucketName,
+      auditResult.dangerousRules
+    )
+  );
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function main(
@@ -478,6 +584,7 @@ export async function main(
         bucket: { type: "string" },
         "older-than": { type: "string", default: "7" },
         "include-versions": { type: "boolean", default: false },
+        "audit-transitions": { type: "boolean", default: false },
         out: { type: "string" },
         plan: { type: "string" },
         confirm: { type: "boolean", default: false },
@@ -566,6 +673,8 @@ export async function main(
 
   const includeVersions =
     values["include-versions"] === true || command === "scan-versions";
+  const auditTransitions =
+    values["audit-transitions"] === true || command === "audit-transitions";
   const excludeBuckets = splitCsv(getString(values["exclude-bucket"]));
   const excludeRegions = splitCsv(getString(values["exclude-region"]));
   const failOnUnprotected = values["fail-on-unprotected"] === true;
@@ -741,6 +850,7 @@ export async function main(
             discoveryClient,
             clientPool: pool,
             checkpointUri: checkpoint,
+            auditTransitions,
           });
         } catch (err) {
           if (err instanceof DiscoveryAuthError) {
@@ -796,8 +906,23 @@ export async function main(
         log(`  Total Zombie Uploads:     ${fleetResult.totalZombieUploads}`);
         log(`  Total Stranded Storage:   ${formatBytes(fleetResult.totalStrandedBytes)}`);
         log(`  Estimated Monthly Waste:  ${formatMonthlyCost(fleetResult.totalEstimatedMonthlyWasteUSD)}`);
+        if (auditTransitions && fleetResult.totalTransitionPenaltyUSD !== undefined) {
+          log(`  Transition Trap Penalty:  ${formatMonthlyCost(fleetResult.totalTransitionPenaltyUSD)}`);
+        }
         log(``);
         renderFleetTable(fleetResult, log);
+
+        if (auditTransitions) {
+          const bucketsWithTraps = fleetResult.bucketResults.filter(
+            (b) => b.transitionAudit && b.transitionAudit.dangerousRules.length > 0
+          );
+          if (bucketsWithTraps.length > 0) {
+            log(`\n⚠️  Transition Traps detected in ${bucketsWithTraps.length} bucket(s):`);
+            for (const b of bucketsWithTraps) {
+              renderTransitionTable(b.transitionAudit!, log);
+            }
+          }
+        }
 
         const hasUnprotectedFleet = fleetResult.bucketResults.some(
           (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
@@ -828,11 +953,15 @@ export async function main(
 
       const client = createS3Client(clientConfig);
 
-      const [scanResult, lifecycleAudit, versionResult] = await Promise.all([
+      const shouldAuditTransitions = values["audit-transitions"] === true;
+      const [scanResult, lifecycleAudit, versionResult, transitionResult] = await Promise.all([
         scanMultipartUploads(client, bucketArg, { olderThanDays, endpoint, prefix }),
         auditBucketLifecycle(client, bucketArg, endpoint),
         includeVersions
           ? scanObjectVersions(client, bucketArg, { olderThanDays, prefix })
+          : Promise.resolve(null),
+        shouldAuditTransitions
+          ? auditBucketTransitions(client, bucketArg, { prefix })
           : Promise.resolve(null),
       ]);
 
@@ -877,6 +1006,7 @@ export async function main(
               uploads: enrichedUploads,
               lifecycleAudit,
               versioning: versionResult ?? undefined,
+              transitionAudit: transitionResult ?? undefined,
             },
             null,
             2
@@ -959,10 +1089,144 @@ export async function main(
         renderVersioningTable(versionResult, log);
       }
 
+      // Display transition audit table if requested
+      if (transitionResult) {
+        renderTransitionTable(transitionResult, log);
+      }
+
       log("\nNext steps:");
       log(`  Generate an execution plan to safely clean up:`);
       log(`  $ s3-guardian plan ${bucketArg}${includeVersions ? " --include-versions" : ""} --out plan.json\n`);
 
+      return EXIT_CODES.SUCCESS;
+    }
+
+    // ── AUDIT-TRANSITIONS ────────────────────────────────────────────────────
+    case "audit-transitions": {
+      // ── Fleet mode: --all-buckets ──────────────────────────────────────────
+      if (allBuckets) {
+        if (!isJson) {
+          log(`🔍 Fleet transition audit: discovering all account buckets...`);
+        }
+
+        const pool = new S3ClientPool();
+        const discoveryClient = createS3Client(clientConfig);
+
+        let allBucketsList: Array<{ Name?: string }>;
+        try {
+          const listRes = await discoveryClient.send(new ListBucketsCommand({}));
+          allBucketsList = listRes.Buckets ?? [];
+        } catch (err) {
+          error(`\n❌ Bucket discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+          return EXIT_CODES.DISCOVERY_AUTH_ERROR;
+        }
+
+        const filteredBuckets = allBucketsList.filter((b) => {
+          if (!b.Name) return false;
+          if (excludeBuckets.length > 0 && matchesExcludePattern(b.Name, excludeBuckets)) {
+            return false;
+          }
+          return true;
+        });
+
+        const auditResults: BucketTransitionAuditResult[] = [];
+        for (const b of filteredBuckets) {
+          const bucketName = b.Name!;
+          try {
+            let bucketRegion = clientConfig.region;
+            if (!bucketRegion) {
+              try {
+                const locRes = await discoveryClient.send(
+                  new GetBucketLocationCommand({ Bucket: bucketName })
+                );
+                bucketRegion = normalizeBucketRegion(locRes.LocationConstraint);
+              } catch {
+                bucketRegion = US_EAST_1;
+              }
+            }
+            if (
+              excludeRegions.length > 0 &&
+              excludeRegions.some((r) => r.toLowerCase() === (bucketRegion || "").toLowerCase())
+            ) {
+              continue;
+            }
+            const bucketClient = pool.getClient(bucketRegion || US_EAST_1);
+            const res = await auditBucketTransitions(bucketClient, bucketName, { prefix });
+            auditResults.push(res);
+          } catch {
+            // gracefully continue fleet scan
+          }
+        }
+
+        await pool.destroy();
+
+        const totalPenaltyUSD =
+          Math.round(
+            auditResults.reduce((sum, r) => sum + r.totalEstimatedPenaltyUSD, 0) * 100
+          ) / 100;
+
+        const dangerousBuckets = auditResults.filter(
+          (r) => r.dangerousRules.length > 0
+        );
+
+        if (isJson) {
+          log(
+            JSON.stringify(
+              {
+                buckets: auditResults,
+                totalEstimatedPenaltyUSD: totalPenaltyUSD,
+                bucketsAudited: auditResults.length,
+                dangerousBucketsCount: dangerousBuckets.length,
+              },
+              null,
+              2
+            )
+          );
+          return EXIT_CODES.SUCCESS;
+        }
+
+        log(`\nFleet Transition Audit Summary:`);
+        log(`  Buckets Audited:           ${auditResults.length}`);
+        log(`  Buckets with Traps:        ${dangerousBuckets.length}`);
+        log(`  Total Projected Penalty:   ${formatMonthlyCost(totalPenaltyUSD)}`);
+
+        if (dangerousBuckets.length === 0) {
+          log(`\n✅ Clean! No transition traps detected across all audited buckets.`);
+        } else {
+          for (const d of dangerousBuckets) {
+            renderTransitionTable(d, log);
+          }
+        }
+
+        return EXIT_CODES.SUCCESS;
+      }
+
+      // ── Single-bucket mode ─────────────────────────────────────────────────
+      if (!bucketArg) {
+        error(
+          "Error: Bucket name is required for 'audit-transitions'. Usage: s3-guardian audit-transitions <bucket>"
+        );
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (!isJson) {
+        log(`🔍 Auditing lifecycle transitions in bucket '${bucketArg}'...`);
+      }
+
+      const client = createS3Client(clientConfig);
+      const auditResult = await auditBucketTransitions(client, bucketArg, { prefix });
+
+      if (isJson) {
+        log(JSON.stringify(auditResult, null, 2));
+        return EXIT_CODES.SUCCESS;
+      }
+
+      if (!auditResult.hasLifecyclePolicy) {
+        log(`\nℹ️  Bucket '${bucketArg}' has no lifecycle configuration.`);
+        return EXIT_CODES.SUCCESS;
+      }
+
+      renderTransitionTable(auditResult, log);
       return EXIT_CODES.SUCCESS;
     }
 

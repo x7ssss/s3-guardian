@@ -11,6 +11,7 @@ import {
   PutBucketLifecycleConfigurationCommand,
   ListObjectVersionsCommand,
   DeleteObjectsCommand,
+  ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { OrganizationsClient, ListAccountsCommand } from "@aws-sdk/client-organizations";
@@ -66,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.0.1");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.1.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -958,4 +959,168 @@ describe("CLI entrypoint and subcommand flow", () => {
       await fs.unlink(tempCsv).catch(() => {});
     }
   });
+
+  // ─── Transition Auditor CLI Tests ──────────────────────────────────────────
+
+  it("audit-transitions returns 2 if bucket is omitted and not --all-buckets", async () => {
+    const code = await main(["audit-transitions"], captureIO);
+    expect(code).toBe(2);
+    expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'audit-transitions'");
+  });
+
+  it("audit-transitions <bucket> renders terminal output table with columns and actionable tip", async () => {
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+      Rules: [
+        {
+          ID: "glacier-trap-rule",
+          Status: "Enabled",
+          Filter: {},
+          Transitions: [
+            {
+              Days: 30,
+              StorageClass: "GLACIER",
+            },
+          ],
+        },
+      ],
+    });
+
+    s3Mock.on(ListObjectsV2Command).resolves({
+      Contents: Array.from({ length: 1000 }, (_, i) => ({
+        Key: `small-${i}.txt`,
+        Size: 1024,
+      })),
+    });
+
+    const code = await main(["audit-transitions", "test-bucket"], captureIO);
+    expect(code).toBe(0);
+
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("Auditing lifecycle transitions in bucket 'test-bucket'");
+    expect(output).toContain("Rule ID");
+    expect(output).toContain("Target Tier");
+    expect(output).toContain("Days");
+    expect(output).toContain("Min Size Filter");
+    expect(output).toContain("Small-Object Risk");
+    expect(output).toContain("Est. Penalty/Mo");
+    expect(output).toContain("Status");
+    expect(output).toContain("glacier-trap-rule");
+    expect(output).toContain("GLACIER");
+    expect(output).toContain("HIGH (< 128 KiB)");
+    expect(output).toContain("TRAP DETECTED");
+    expect(output).toContain("Actionable Tip: Small-object transition traps detected!");
+    expect(output).toContain("object_size_greater_than = 131072");
+  });
+
+  it("audit-transitions <bucket> --json outputs machine-readable JSON", async () => {
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+      Rules: [
+        {
+          ID: "unconstrained-ia",
+          Status: "Enabled",
+          Filter: {},
+          Transitions: [
+            {
+              Days: 60,
+              StorageClass: "STANDARD_IA",
+            },
+          ],
+        },
+      ],
+    });
+
+    s3Mock.on(ListObjectsV2Command).resolves({
+      Contents: [],
+    });
+
+    const code = await main(["audit-transitions", "json-test-bucket", "--json"], captureIO);
+    expect(code).toBe(0);
+
+    const parsed = JSON.parse(stdoutLogs.join(""));
+    expect(parsed.bucketName).toBe("json-test-bucket");
+    expect(parsed.hasLifecyclePolicy).toBe(true);
+    expect(parsed.dangerousRules).toHaveLength(1);
+    expect(parsed.dangerousRules[0].ruleId).toBe("unconstrained-ia");
+    expect(parsed.dangerousRules[0].targetStorageClass).toBe("STANDARD_IA");
+    expect(parsed.dangerousRules[0].recommendedMinSize).toBe(131072);
+  });
+
+  it("audit-transitions --all-buckets scans all buckets and outputs fleet summary", async () => {
+    s3Mock.on(ListBucketsCommand).resolves({
+      Buckets: [{ Name: "fleet-bucket-1" }, { Name: "fleet-bucket-2" }],
+    });
+    s3Mock.on(GetBucketLocationCommand).resolves({
+      LocationConstraint: "us-east-1",
+    });
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+      Rules: [
+        {
+          ID: "trap-rule",
+          Status: "Enabled",
+          Filter: {},
+          Transitions: [
+            {
+              Days: 30,
+              StorageClass: "GLACIER",
+            },
+          ],
+        },
+      ],
+    });
+    s3Mock.on(ListObjectsV2Command).resolves({
+      Contents: [],
+    });
+
+    const code = await main(["audit-transitions", "--all-buckets", "--json"], captureIO);
+    expect(code).toBe(0);
+
+    const parsed = JSON.parse(stdoutLogs.join(""));
+    expect(parsed.bucketsAudited).toBe(2);
+    expect(parsed.dangerousBucketsCount).toBe(2);
+    expect(Array.isArray(parsed.buckets)).toBe(true);
+  });
+
+  it("scan <bucket> --audit-transitions includes transition audit in table and JSON output", async () => {
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      Uploads: [],
+    });
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+      Rules: [
+        {
+          ID: "scan-transition-rule",
+          Status: "Enabled",
+          Filter: {},
+          Transitions: [
+            {
+              Days: 30,
+              StorageClass: "GLACIER",
+            },
+          ],
+        },
+      ],
+    });
+    s3Mock.on(ListObjectsV2Command).resolves({
+      Contents: [],
+    });
+
+    // Test JSON mode
+    stdoutLogs = [];
+    const codeJson = await main(["scan", "scan-bucket", "--audit-transitions", "--json"], captureIO);
+    expect(codeJson).toBe(0);
+    const parsed = JSON.parse(stdoutLogs.join(""));
+    expect(parsed.transitionAudit).toBeDefined();
+    expect(parsed.transitionAudit.dangerousRules).toHaveLength(1);
+    expect(parsed.transitionAudit.dangerousRules[0].ruleId).toBe("scan-transition-rule");
+
+    // Test table mode
+    stdoutLogs = [];
+    const codeTable = await main(["scan", "scan-bucket", "--audit-transitions"], captureIO);
+    expect(codeTable).toBe(0);
+    const tableOutput = stdoutLogs.join("\n");
+    expect(tableOutput).toContain("Rule ID");
+    expect(tableOutput).toContain("Target Tier");
+    expect(tableOutput).toContain("scan-transition-rule");
+    expect(tableOutput).toContain("Actionable Tip: Small-object transition traps detected!");
+  });
 });
+

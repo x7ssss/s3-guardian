@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.0.0 (General Availability)  
+**Version:** 1.1.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -222,3 +222,54 @@ Generation command:
 npm run build:sea
 ```
 This produces a standalone binary preparation blob ready for node injection without external `node_modules` distribution requirements.
+
+---
+
+## 9. Glacier & Storage Class Transition Trap Auditor Specification (v1.1.0)
+
+### 9.1 Small-Object Transition Penalty Mechanics & Exact Byte-Level Math
+
+Transitioning small objects into archive or infrequent access tiers often causes significant financial penalties rather than savings due to minimum billable size floors, fixed metadata overhead, and transition request fees.
+
+#### Mathematical Pricing Invariants (US-East-1 Baseline):
+1. **S3 Standard Baseline Rate:** $0.023 / GiB / month ($0.00000002142 / byte / month).
+2. **Standard-IA / One Zone-IA Floor:**
+   - Minimum billable size floor: 128 KiB (131,072 bytes).
+   - Any object with size $< 131,072$ bytes is billed for 131,072 bytes at $0.0125 / GiB / month (or $0.0100 for One Zone-IA).
+   - Transition request fee: $0.01 / 1,000 requests ($0.00001 / request).
+3. **Glacier Instant Retrieval (GIR) Floor:**
+   - Minimum billable size floor: 128 KiB (131,072 bytes).
+   - Storage rate: $0.0040 / GiB / month.
+   - Transition request fee: $0.05 / 1,000 requests ($0.00005 / request).
+4. **Glacier Flexible Retrieval (GFR) & Deep Archive (GDA) Fixed Metadata Overhead:**
+   - Actual object size is billed with NO 128 KiB floor.
+   - **Fixed 40 KiB metadata overhead per object:**
+     - 8 KiB billed at S3 Standard rate ($0.023 / GiB / month) for object name and metadata.
+     - 32 KiB billed at target Glacier tier rate ($0.0036 / GiB / month for GFR, $0.00099 / GiB / month for GDA) for index and vault metadata.
+   - Transition request fee: $0.05 / 1,000 requests ($0.00005 / request).
+
+#### Net Monthly Delta & Breakeven Formula:
+- $\text{EffectiveBillableSize} = \max(\text{AverageSizeBytes}, \text{MinBillableFloor})$
+- $\text{TargetMonthlyStorage} = (\text{ObjectCount} \times \text{EffectiveBillableSize} / \text{GiB}) \times \text{TierRate}$
+- $\text{MetadataOverheadMonthly} = (\text{ObjectCount} \times 8192 / \text{GiB}) \times 0.023 + (\text{ObjectCount} \times 32768 / \text{GiB}) \times \text{GlacierRate}$
+- $\text{AmortizedTransitionFee} = \text{TransitionRequestFee} / (\text{DurationDays} / 30)$
+- $\text{NetMonthlyDelta} = \text{TargetMonthlyStorage} + \text{MetadataOverheadMonthly} + \text{AmortizedTransitionFee} - \text{BaselineStandardCost}$
+- $\text{isPenalty} = \text{NetMonthlyDelta} > 0$
+- If ongoing monthly savings $\le 0$: $\text{breakevenMonths} = \text{null}$ (penalty in perpetuity).
+- If ongoing monthly savings $> 0$: $\text{breakevenMonths} = \text{TransitionRequestFee} / \text{OngoingMonthlySavings}$.
+
+### 9.2 Transition Rule Audit Protocol
+
+The `auditBucketTransitions` engine inspects all enabled `LifecycleRule` elements returned by `GetBucketLifecycleConfigurationCommand`:
+1. Inspects both standard `Transitions` and `NoncurrentVersionTransitions`.
+2. Flags any rule targeting `STANDARD_IA`, `ONEZONE_IA`, `GLACIER_IR`, `GLACIER`, or `DEEP_ARCHIVE` that:
+   - Completely LACKS an `ObjectSizeGreaterThan` filter constraint, OR
+   - Defines `ObjectSizeGreaterThan < 131072` bytes (128 KiB).
+3. Samples bucket small-object density ($< 128$ KiB) via `ListObjectsV2Command` to quantify actual object count and average small-object size.
+4. Computes deterministic projected financial penalty in USD/month.
+
+### 9.3 Automated IaC Remediation & Filter Injection
+
+To eliminate drift and ensure GitOps compliance:
+- Lifecycle remediation generators automatically inject `object_size_greater_than = 131072` (Terraform) and `ObjectSizeGreaterThan: 131072` (CloudFormation) inside rule filters when transition targets are specified.
+- Dedicated remediation generators (`generateTerraformTransitionRemediation`, `generateCloudFormationTransitionRemediation`) emit drop-in HCL / YAML snippets to instantly constrain unconstrained existing transition rules.

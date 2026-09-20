@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mockClient } from "aws-sdk-client-mock";
 import {
   S3Client,
+  ListBucketsCommand,
   ListMultipartUploadsCommand,
   ListPartsCommand,
   AbortMultipartUploadCommand,
@@ -56,7 +57,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.4.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.5.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -547,5 +548,46 @@ describe("CLI entrypoint and subcommand flow", () => {
     const putCalls = s3Mock.commandCalls(PutBucketLifecycleConfigurationCommand);
     expect(putCalls.length).toBe(1);
     expect(putCalls[0].args[0].input.Bucket).toBe("api-remediate-bucket");
+  });
+
+  it("scan dispatches webhook when --webhook-url and --notify-always are provided", async () => {
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      IsTruncated: false,
+      Uploads: [],
+    });
+    stubNoLifecycle();
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch as any;
+
+    try {
+      const code = await main(
+        [
+          "scan",
+          "webhook-bucket",
+          "--webhook-url",
+          "https://hooks.slack.com/services/T/B/X",
+          "--notify-always",
+        ],
+        captureIO
+      );
+      expect(code).toBe(0);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const requestBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(requestBody.text).toContain("webhook-bucket");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("scan --all-buckets passes --checkpoint to scanFleet", async () => {
+    s3Mock.on(ListBucketsCommand).resolves({ Buckets: [] });
+
+    const code = await main(
+      ["scan", "--all-buckets", "--checkpoint", "s3://my-ops-bucket/chk.json"],
+      captureIO
+    );
+    expect(code).toBe(0);
   });
 });

@@ -81,5 +81,26 @@ export {
   DirectApplyOptions,
   TARGET_RULE_ID,
 } from "./remediation/api.js";
+export {
+  dispatchNotification,
+  detectWebhookType,
+  shouldSendNotification,
+  buildSlackPayload,
+  buildDiscordPayload,
+  buildPagerDutyPayload,
+  buildGenericPayload,
+  AuditNotificationData,
+  DispatchOptions,
+  DispatchResult,
+  WebhookType,
+} from "./notifications/dispatcher.js";
+export {
+  loadCheckpoint,
+  saveCheckpoint,
+  parseS3Uri,
+  CheckpointState,
+  ParsedS3Uri,
+} from "./checkpoint/s3-checkpoint.js";
+export { handler, LambdaEvent, LambdaResult } from "./lambda.js";
 export { createConcurrencyLimiter, LimitFunction } from "./utils/concurrency.js";
 export { withRetry, isSlowDownError, RetryOptions } from "./utils/retry.js";

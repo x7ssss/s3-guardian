@@ -64,6 +64,8 @@ export interface FleetScanResult {
   bucketResults: BucketAuditResult[];
 }
 
+import { loadCheckpoint, saveCheckpoint, CheckpointState } from "../checkpoint/s3-checkpoint.js";
+
 // ─── Filter types ─────────────────────────────────────────────────────────────
 
 export interface FleetScanOptions {
@@ -88,6 +90,8 @@ export interface FleetScanOptions {
   discoveryClient?: S3Client;
   /** Optional client pool to reuse regional clients across bucket audits */
   clientPool?: S3ClientPool;
+  /** Optional S3 URI for checkpoint state (e.g. s3://bucket/key.json) */
+  checkpointUri?: string;
 }
 
 // ─── Pattern matching ─────────────────────────────────────────────────────────
@@ -295,7 +299,24 @@ export async function scanFleet(
 
   const bucketsDiscovered = allBuckets.length;
 
-  // ── Step 2: Resolve regions and apply filters ─────────────────────────────
+  // ── Step 2: Load checkpoint (if provided) and resolve regions ─────────────
+  let checkpointState: CheckpointState = {
+    completedBuckets: [],
+    lastUpdatedAt: new Date().toISOString(),
+  };
+  const completedMap = new Map<string, BucketAuditResult>();
+
+  if (options.checkpointUri) {
+    try {
+      checkpointState = await loadCheckpoint(discoveryClient, options.checkpointUri);
+      for (const b of checkpointState.completedBuckets) {
+        completedMap.set(b.bucket, b);
+      }
+    } catch {
+      // Best-effort: proceed without checkpoint if load fails
+    }
+  }
+
   const clientPool = options.clientPool ?? new S3ClientPool();
   const bucketResults: BucketAuditResult[] = [];
   const toAudit: Array<{ name: string; region: string }> = [];
@@ -303,6 +324,12 @@ export async function scanFleet(
   for (const bucket of allBuckets) {
     const name = bucket.Name;
     if (!name) continue;
+
+    // Resumable checkpointing: skip buckets already audited in checkpoint
+    if (completedMap.has(name)) {
+      bucketResults.push(completedMap.get(name)!);
+      continue;
+    }
 
     // Apply name-based exclusion
     if (
@@ -351,11 +378,30 @@ export async function scanFleet(
     toAudit.push({ name, region });
   }
 
-  // ── Step 3: Dispatch concurrent audits ────────────────────────────────────
+  // ── Step 3: Dispatch concurrent audits with incremental checkpointing ─────
   const limiter = createConcurrencyLimiter(bucketConcurrency);
 
+  let saveChain = Promise.resolve();
+  const onBucketAuditCompleted = async (result: BucketAuditResult) => {
+    if (options.checkpointUri) {
+      saveChain = saveChain.then(async () => {
+        checkpointState.completedBuckets.push(result);
+        await saveCheckpoint(
+          discoveryClient,
+          options.checkpointUri!,
+          checkpointState
+        ).catch(() => {});
+      });
+      await saveChain;
+    }
+  };
+
   const auditPromises = toAudit.map(({ name, region }) =>
-    limiter(() => auditOneBucket(name, region, options, clientPool))
+    limiter(async () => {
+      const result = await auditOneBucket(name, region, options, clientPool);
+      await onBucketAuditCompleted(result);
+      return result;
+    })
   );
 
   const auditResults = await Promise.all(auditPromises);

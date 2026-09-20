@@ -11,8 +11,9 @@ import { evaluatePolicy, EXIT_CODES, PolicyOptions } from "./policy/evaluator.js
 import { S3ClientPool } from "./discovery/client-pool.js";
 import { formatOrSaveIac, IacFormat } from "./remediation/iac.js";
 import { applyLifecycleRuleDirectly } from "./remediation/api.js";
+import { dispatchNotification, WebhookType } from "./notifications/dispatcher.js";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads
@@ -53,6 +54,10 @@ OPTIONS:
   --out-iac <path>             Write generated IaC code to a file instead of stdout
   --days <n>                   MPU age threshold in days for lifecycle rule (default: 7)
   --danger-direct-api-apply    Directly apply lifecycle rule to S3 via API (bypasses GitOps)
+  --webhook-url <url>          Dispatch audit summary to Slack, Discord, PagerDuty, or Generic webhook
+  --webhook-type <type>        Explicit webhook target: slack | discord | pagerduty | generic (autodetected if omitted)
+  --notify-always              Dispatch webhook even if total waste is $0.00 (bypasses circuit breaker)
+  --checkpoint <s3-uri>        S3 URI (s3://bucket/key.json) for resumable fleet scanning across execution limits
   -h, --help                   Show this help message
   -v, --version                Show version
 
@@ -231,6 +236,10 @@ export async function main(
         "out-iac": { type: "string" },
         days: { type: "string", default: "7" },
         "danger-direct-api-apply": { type: "boolean", default: false },
+        "webhook-url": { type: "string" },
+        "webhook-type": { type: "string" },
+        "notify-always": { type: "boolean", default: false },
+        checkpoint: { type: "string" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -279,6 +288,10 @@ export async function main(
   const formatStr = getString(values.format) ?? "table";
   const isJson = values.json === true || formatStr === "json";
   const isGitHub = formatStr === "github";
+  const webhookUrl = getString(values["webhook-url"]);
+  const webhookType = getString(values["webhook-type"]) as WebhookType | undefined;
+  const notifyAlways = values["notify-always"] === true;
+  const checkpoint = getString(values.checkpoint);
 
   // Parse --max-waste-usd
   let maxWasteUSD: number | undefined;
@@ -318,6 +331,7 @@ export async function main(
             endpoint,
             discoveryClient,
             clientPool: pool,
+            checkpointUri: checkpoint,
           });
         } catch (err) {
           if (err instanceof DiscoveryAuthError) {
@@ -329,13 +343,34 @@ export async function main(
           await pool.destroy();
         }
 
-        if (isJson) {
-          log(JSON.stringify(fleetResult, null, 2));
-          const policyResult = evaluatePolicy(fleetResult, policyOptions);
-          return policyResult.exitCode;
+        const policyResult = evaluatePolicy(fleetResult, policyOptions);
+
+        // Webhook notification dispatch
+        if (webhookUrl) {
+          await dispatchNotification(
+            {
+              scope: "fleet",
+              target: "all-buckets",
+              totalZombieUploads: fleetResult.totalZombieUploads,
+              totalStrandedBytes: fleetResult.totalStrandedBytes,
+              totalEstimatedMonthlyWasteUSD: fleetResult.totalEstimatedMonthlyWasteUSD,
+              bucketsDiscovered: fleetResult.bucketsDiscovered,
+              bucketsAudited: fleetResult.bucketsAudited,
+              bucketsSkipped: fleetResult.bucketsSkipped,
+              policyViolations: policyResult.violations.map((v) => v.message),
+            },
+            {
+              webhookUrl,
+              webhookType,
+              notifyAlways,
+            }
+          );
         }
 
-        const policyResult = evaluatePolicy(fleetResult, policyOptions);
+        if (isJson) {
+          log(JSON.stringify(fleetResult, null, 2));
+          return policyResult.exitCode;
+        }
 
         if (isGitHub) {
           renderFleetGitHub(
@@ -359,7 +394,7 @@ export async function main(
 
         // Check if any bucket is unprotected or has ghost rules
         const hasUnprotectedFleet = fleetResult.bucketResults.some(
-          (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || b.lifecycleAudit?.ghostRulesDetected?.length)
+          (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
         );
         if (hasUnprotectedFleet) {
           log(`\n💡 Tip: Run \`s3-guardian remediate --all-buckets\` to generate Terraform/CloudFormation fix.`);
@@ -402,6 +437,25 @@ export async function main(
         );
         return { ...u, lifecycleStatus: coverage.status };
       });
+
+      // Webhook notification dispatch
+      if (webhookUrl) {
+        await dispatchNotification(
+          {
+            scope: "bucket",
+            target: bucketArg,
+            totalZombieUploads: scanResult.totalZombieUploads,
+            totalStrandedBytes: scanResult.totalStrandedBytes,
+            totalEstimatedMonthlyWasteUSD: scanResult.estimatedMonthlyWasteUSD,
+            policyViolations: [],
+          },
+          {
+            webhookUrl,
+            webhookType,
+            notifyAlways,
+          }
+        );
+      }
 
       if (isJson) {
         log(JSON.stringify({ ...scanResult, uploads: enrichedUploads, lifecycleAudit }, null, 2));
@@ -504,6 +558,7 @@ export async function main(
             endpoint,
             discoveryClient,
             clientPool: pool,
+            checkpointUri: checkpoint,
           });
         } catch (err) {
           if (err instanceof DiscoveryAuthError) {
@@ -531,7 +586,7 @@ export async function main(
         log(`  Estimated Monthly Waste:  ${formatMonthlyCost(fleetResult.totalEstimatedMonthlyWasteUSD)}`);
 
         const hasUnprotectedFleet = fleetResult.bucketResults.some(
-          (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || b.lifecycleAudit?.ghostRulesDetected?.length)
+          (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
         );
         if (hasUnprotectedFleet) {
           log(`\n💡 Tip: Run \`s3-guardian remediate --all-buckets\` to generate Terraform/CloudFormation fix.`);
@@ -652,6 +707,7 @@ export async function main(
               endpoint,
               discoveryClient,
               clientPool: pool,
+              checkpointUri: checkpoint,
             });
 
             const eligibleBuckets = fleetResult.bucketResults.filter(

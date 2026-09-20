@@ -11,11 +11,28 @@ export {
   validatePlan,
   writePlanFile,
   readPlanFile,
+  verifyPlanIntegrity,
   Plan,
   ZombieUploadItem,
   CreatePlanOptions,
   VersionDeletionEntry,
 } from "./planner/plan.js";
+export {
+  canonicalizeJson,
+  computeSha256Hex,
+  computePlanHash,
+  getPlanCanonicalPayload,
+  PlanHashableTargets,
+} from "./planner/jcs.js";
+export {
+  assessBucketBlastRadius,
+  PROTECTED_PREFIXES,
+  BlastRadiusRisk,
+  BlastRadiusFinding,
+  BlastRadiusTargetItem,
+  BlastRadiusOptions,
+  BlastRadiusAssessment,
+} from "./safety/blast-radius.js";
 export {
   scanMultipartUploads,
   scanMultipartUploadsStream,
@@ -118,6 +135,7 @@ export {
   VersionExecutorOptions,
   VersionExecutionResult,
   VersionDeletionFailure,
+  CloudTrailCorrelationBatch,
 } from "./versioning/executor.js";
 export { handler, LambdaEvent, LambdaResult } from "./lambda.js";
 export { createConcurrencyLimiter, LimitFunction } from "./utils/concurrency.js";

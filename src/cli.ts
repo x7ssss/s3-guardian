@@ -2,7 +2,15 @@
 import { parseArgs } from "node:util";
 import { createS3Client } from "./client.js";
 import { scanMultipartUploads } from "./scanner/multipart.js";
-import { createPlan, writePlanFile, readPlanFile, Plan, VersionDeletionEntry } from "./planner/plan.js";
+import {
+  createPlan,
+  writePlanFile,
+  readPlanFile,
+  verifyPlanIntegrity,
+  Plan,
+  VersionDeletionEntry,
+} from "./planner/plan.js";
+import { assessBucketBlastRadius, BlastRadiusTargetItem } from "./safety/blast-radius.js";
 import { executeAbortPlan } from "./executor/abort.js";
 import { formatBytes, formatMonthlyCost } from "./cost/estimator.js";
 import { auditBucketLifecycle, evaluateUploadCoverage } from "./lifecycle/audit.js";
@@ -27,7 +35,7 @@ import {
 import { readStorageLensMetrics } from "./lens/reader.js";
 import { StorageLensBucketMetrics } from "./lens/scorer.js";
 
-const VERSION = "0.8.0";
+const VERSION = "1.0.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioning waste
@@ -52,7 +60,7 @@ COMMANDS:
   scan --all-buckets      Read-only fleet scan across all account buckets
   scan --org              Multi-account sweep across AWS Organizations accounts
   scan-versions <bucket>  Scan for noncurrent object versions and expired delete markers
-  plan <bucket>           Generate an inspectable, deterministic JSON plan file
+  plan <bucket>           Generate an inspectable, deterministic JSON plan file (RFC 8785 verified)
   plan --all-buckets      Generate a fleet-wide plan (summary JSON)
   plan --org              Generate a multi-account organization plan (summary JSON)
   apply                   Execute aborts and version deletions defined in a plan file (requires --confirm)
@@ -65,6 +73,9 @@ OPTIONS:
   --out <file>                 Output path for plan file (default: plan.json)
   --plan <file>                Plan file to apply
   --confirm                    Explicit confirmation required to execute apply deletions
+  --bypass-governance          Bypass S3 Object Lock GOVERNANCE mode retention for version purges
+  --acknowledge-replication-divergence Acknowledge replica divergence on buckets with active replication
+  --allow-active-churn         Allow deletion of uploads or versions modified within 24 hours
   --endpoint <url>             Custom S3 endpoint URL (MinIO, Cloudflare R2, LocalStack)
   --force-path-style           Use S3 path-style addressing
   --region <region>            AWS Region (default: us-east-1 or AWS_REGION)
@@ -103,6 +114,8 @@ EXIT CODES:
 
 SAFETY GUARANTEES:
   • 'scan', 'scan-versions', and 'plan' are 100% read-only.
+  • Pre-flight blast radius simulator prevents accidental deletion under Object Lock, replication, protected prefixes, tags, and churn.
+  • Cryptographic RFC 8785 SHA-256 integrity verification guarantees plan immutability prior to apply.
   • 'remediate' defaults to generating deterministic IaC code (GitOps-first).
   • Direct API mutation requires explicit '--danger-direct-api-apply' and preserves 100% of existing rules.
   • 'apply' strictly requires both a valid plan file and the '--confirm' flag.
@@ -110,6 +123,7 @@ SAFETY GUARANTEES:
   • Multi-account mode: member account failures (403, SCP, STS) never abort the multi-account audit.
   • 'lens' operates with zero data-plane overhead, reading only macroscopic export metrics without object-level APIs.
   • Bulk deletion uses Quiet mode while unconditionally inspecting response.Errors.
+  • CloudTrail request ID correlation is captured for all batch mutations.
 `;
 
 export interface CliOptions {
@@ -467,6 +481,9 @@ export async function main(
         out: { type: "string" },
         plan: { type: "string" },
         confirm: { type: "boolean", default: false },
+        "bypass-governance": { type: "boolean", default: false },
+        "acknowledge-replication-divergence": { type: "boolean", default: false },
+        "allow-active-churn": { type: "boolean", default: false },
         endpoint: { type: "string" },
         "force-path-style": { type: "boolean", default: false },
         region: { type: "string" },
@@ -1136,6 +1153,19 @@ export async function main(
         ];
       }
 
+      const blastRadiusTargets: BlastRadiusTargetItem[] = [
+        ...enrichedUploads.map((u) => ({ key: u.key, timestamp: u.initiated })),
+        ...(versionDeletions ?? []).map((v) => ({ key: v.key, timestamp: v.lastModified })),
+      ];
+
+      const blastRadiusAudit = await assessBucketBlastRadius(client, bucketArg, {
+        targets: blastRadiusTargets,
+        bypassGovernance: values["bypass-governance"] === true,
+        acknowledgeReplicationDivergence: values["acknowledge-replication-divergence"] === true,
+        allowActiveChurn: values["allow-active-churn"] === true,
+        now,
+      });
+
       const plan: Plan = createPlan({
         bucket: bucketArg,
         endpoint,
@@ -1143,6 +1173,7 @@ export async function main(
         uploads: enrichedUploads,
         versionDeletions,
         lifecycleAudit,
+        blastRadiusAudit,
       });
 
       await writePlanFile(outFile, plan);
@@ -1160,7 +1191,20 @@ export async function main(
         log(`  Versioning Monthly Waste: ${formatMonthlyCost(plan.versioningMonthlyWasteUSD ?? 0)}`);
       }
 
+      log(`  Blast Radius Risk:        ${blastRadiusAudit.riskLevel}`);
+      if (plan.planHash) {
+        log(`  Plan SHA-256 (RFC 8785):  ${plan.planHash}`);
+      }
+
       log(`  Plan File:                ${outFile}`);
+
+      if (blastRadiusAudit.findings.length > 0) {
+        log(`\n🛡️  Blast Radius Assessment:`);
+        for (const f of blastRadiusAudit.findings) {
+          const icon = f.risk === "CRITICAL_BLOCKED" ? "⛔" : f.risk === "HIGH" ? "⚠️ " : "ℹ️ ";
+          log(`  ${icon} [${f.code}] ${f.message}`);
+        }
+      }
 
       if (lifecycleAudit.providerNotes) {
         log(`\nℹ️  Lifecycle Note: ${lifecycleAudit.providerNotes}`);
@@ -1376,6 +1420,12 @@ export async function main(
         return EXIT_CODES.ARG_ERROR;
       }
 
+      const integrity = verifyPlanIntegrity(plan);
+      if (!integrity.valid) {
+        error(`\n❌ Cryptographic Plan Integrity Violation: ${integrity.error}`);
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+
       const hasUploads = plan.uploads && plan.uploads.length > 0;
       const hasVersions = plan.versionDeletions && plan.versionDeletions.length > 0;
 
@@ -1395,6 +1445,54 @@ export async function main(
       };
       const client = createS3Client(effectiveClientConfig);
 
+      // Pre-flight Blast Radius Simulation
+      log(`🛡️  Running pre-flight blast radius assessment on '${plan.bucket}'...`);
+      const blastRadiusTargets: BlastRadiusTargetItem[] = [
+        ...(plan.uploads ?? []).map((u) => ({ key: u.key, timestamp: u.initiated })),
+        ...(plan.versionDeletions ?? []).map((v) => ({ key: v.key, timestamp: v.lastModified })),
+      ];
+
+      const bypassGov = values["bypass-governance"] === true;
+      const ackRepl = values["acknowledge-replication-divergence"] === true;
+      const allowChurn = values["allow-active-churn"] === true;
+
+      const blastRadius = await assessBucketBlastRadius(client, plan.bucket, {
+        targets: blastRadiusTargets,
+        bypassGovernance: bypassGov,
+        acknowledgeReplicationDivergence: ackRepl,
+        allowActiveChurn: allowChurn,
+      });
+
+      if (blastRadius.isBlocked) {
+        error(`\n❌ Pre-flight blast radius check BLOCKED execution on bucket '${plan.bucket}':`);
+        for (const f of blastRadius.findings.filter((f) => f.risk === "CRITICAL_BLOCKED")) {
+          error(`   ⛔ [${f.code}] ${f.message}`);
+        }
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+
+      if (blastRadius.requiresGovernanceBypass) {
+        error(`\n❌ S3 Object Lock GOVERNANCE mode is active on bucket '${plan.bucket}'.`);
+        error(`   Permanent version deletions require the '--bypass-governance' flag.`);
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+
+      if (blastRadius.requiresReplicationAck) {
+        error(`\n❌ Active replication (CRR/SRR) detected on bucket '${plan.bucket}'.`);
+        error(`   Permanent version purges do NOT replicate across buckets, which will cause replica divergence.`);
+        error(`   Pass '--acknowledge-replication-divergence' to proceed.`);
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+
+      const unacknowledgedHigh = blastRadius.findings.filter((f) => f.risk === "HIGH");
+      if (unacknowledgedHigh.length > 0) {
+        error(`\n❌ Pre-flight safety check failed (HIGH risk detected):`);
+        for (const f of unacknowledgedHigh) {
+          error(`   ⚠️  [${f.code}] ${f.message}`);
+        }
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+
       let hadErrors = false;
 
       // 1. Execute multipart upload aborts
@@ -1402,13 +1500,16 @@ export async function main(
         log(`Executing abort operations for bucket '${plan.bucket}' (${plan.uploads.length} upload(s))...`);
         const abortResult = await executeAbortPlan(client, plan, {
           confirm: true,
-          onProgress: (completed, total, item, status) => {
+          onProgress: (completed, total, item, status, correlation) => {
+            const trace = correlation?.requestId
+              ? ` [x-amz-request-id: ${correlation.requestId}]`
+              : "";
             if (status === "SKIPPED_ALREADY_ABORTED") {
-              log(`  [${completed}/${total}] Skipped '${item.key}' (UploadId: ${item.uploadId}) — already aborted or completed`);
+              log(`  [${completed}/${total}] Skipped '${item.key}' (UploadId: ${item.uploadId}) — already aborted or completed${trace}`);
             } else if (status === "FAILED") {
-              log(`  [${completed}/${total}] Failed '${item.key}' (UploadId: ${item.uploadId})`);
+              log(`  [${completed}/${total}] Failed '${item.key}' (UploadId: ${item.uploadId})${trace}`);
             } else {
-              log(`  [${completed}/${total}] Aborted '${item.key}' (UploadId: ${item.uploadId})`);
+              log(`  [${completed}/${total}] Aborted '${item.key}' (UploadId: ${item.uploadId})${trace}`);
             }
           },
         });
@@ -1439,14 +1540,22 @@ export async function main(
           VersionId: v.versionId,
         }));
 
+        const passBypassGov = Boolean(
+          blastRadius.objectLock?.mode === "GOVERNANCE" && bypassGov
+        );
+
         const versionResult = await executeVersionDeletion(
           client,
           plan.bucket,
           entries,
           {
             confirm: true,
-            onProgress: (deleted, total) => {
-              log(`  [${deleted}/${total}] Deleted object versions...`);
+            bypassGovernance: passBypassGov,
+            onProgress: (deleted, total, correlation) => {
+              const trace = correlation?.requestId
+                ? ` [x-amz-request-id: ${correlation.requestId}]`
+                : "";
+              log(`  [${deleted}/${total}] Deleted object versions...${trace}`);
             },
           }
         );

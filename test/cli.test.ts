@@ -66,7 +66,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.8.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.0.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -262,7 +262,8 @@ describe("CLI entrypoint and subcommand flow", () => {
 
       const fileContent = await fs.readFile(tempFile, "utf8");
       const parsed: Plan = JSON.parse(fileContent);
-      expect(parsed.schemaVersion).toBe("1.1");
+      expect(parsed.schemaVersion).toBe("1.3");
+      expect(parsed.planHash).toBeDefined();
       expect(parsed.bucket).toBe("my-bucket");
       expect(parsed.uploads.length).toBe(1);
       expect(parsed.uploads[0].key).toBe("file.bin");
@@ -364,7 +365,7 @@ describe("CLI entrypoint and subcommand flow", () => {
         {
           key: "file.bin",
           uploadId: "uid-1",
-          initiated: new Date().toISOString(),
+          initiated: new Date(Date.now() - 10 * 86400000).toISOString(),
           partsCount: 1,
           bytes: 1000,
           storageClass: "STANDARD",
@@ -396,7 +397,7 @@ describe("CLI entrypoint and subcommand flow", () => {
     // Write a raw schema 1.0 plan (no storageClass, no lifecycleStatus, no lifecycleAudit)
     const legacyPlan = {
       schemaVersion: "1.0",
-      generatedAt: new Date().toISOString(),
+      generatedAt: new Date(Date.now() - 10 * 86400000).toISOString(),
       bucket: "legacy-bucket",
       endpoint: null,
       olderThanDays: 7,
@@ -407,7 +408,7 @@ describe("CLI entrypoint and subcommand flow", () => {
         {
           key: "legacy.bin",
           uploadId: "uid-legacy",
-          initiated: new Date().toISOString(),
+          initiated: new Date(Date.now() - 10 * 86400000).toISOString(),
           partsCount: 1,
           bytes: 500,
         },
@@ -655,7 +656,8 @@ describe("CLI entrypoint and subcommand flow", () => {
 
       const raw = await fs.readFile(tempFile, "utf8");
       const plan = JSON.parse(raw);
-      expect(plan.schemaVersion).toBe("1.2");
+      expect(plan.schemaVersion).toBe("1.3");
+      expect(plan.planHash).toBeDefined();
       expect(plan.versionDeletions).toHaveLength(1);
       expect(plan.versionDeletions[0].key).toBe("noncurrent.bin");
       expect(plan.versionDeletions[0].versionId).toBe("v-old");
@@ -669,7 +671,7 @@ describe("CLI entrypoint and subcommand flow", () => {
     const tempFile = path.join(os.tmpdir(), `test-plan-apply-ver-${Date.now()}.json`);
     const plan: Plan = {
       schemaVersion: "1.2",
-      generatedAt: new Date().toISOString(),
+      generatedAt: new Date(Date.now() - 10 * 86400000).toISOString(),
       bucket: "apply-ver-bucket",
       endpoint: null,
       olderThanDays: 7,
@@ -688,7 +690,7 @@ describe("CLI entrypoint and subcommand flow", () => {
           versionId: "v-del",
           type: "NONCURRENT_VERSION",
           size: 512,
-          lastModified: new Date().toISOString(),
+          lastModified: new Date(Date.now() - 10 * 86400000).toISOString(),
         },
       ],
       totalNoncurrentVersions: 1,

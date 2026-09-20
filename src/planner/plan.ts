@@ -2,6 +2,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { calculateMonthlyCostUSD } from "../cost/estimator.js";
 import type { LifecycleAuditResult } from "../lifecycle/audit.js";
+import type { BlastRadiusAssessment } from "../safety/blast-radius.js";
+import { computePlanHash } from "./jcs.js";
 
 export type LifecycleStatus =
   | "UNPROTECTED"
@@ -30,7 +32,7 @@ export interface VersionDeletionEntry {
 }
 
 export interface Plan {
-  schemaVersion: "1.1" | "1.2";
+  schemaVersion: "1.1" | "1.2" | "1.3";
   generatedAt: string;
   bucket: string;
   endpoint: string | null;
@@ -44,6 +46,10 @@ export interface Plan {
     ghostRulesDetected: string[];
     providerNotes?: string;
   };
+  /** Pre-flight blast radius assessment results (Schema 1.3) */
+  blastRadiusAudit?: BlastRadiusAssessment;
+  /** RFC 8785 canonical SHA-256 plan integrity hash (Schema 1.3) */
+  planHash?: string;
   /** Only present when total targeted items > 10,000 */
   highVolumeWarning?: string;
   uploads: ZombieUploadItem[];
@@ -61,8 +67,9 @@ export interface CreatePlanOptions {
   uploads?: ZombieUploadItem[];
   versionDeletions?: VersionDeletionEntry[];
   lifecycleAudit: LifecycleAuditResult;
+  blastRadiusAudit?: BlastRadiusAssessment;
   generatedAt?: string;
-  schemaVersion?: "1.1" | "1.2";
+  schemaVersion?: "1.1" | "1.2" | "1.3";
 }
 
 const HIGH_VOLUME_THRESHOLD = 10_000;
@@ -100,7 +107,7 @@ export function createPlan(options: CreatePlanOptions): Plan {
   const estimatedMonthlyWasteUSD = calculateMonthlyCostUSD(totalStrandedBytes);
 
   const hasVersioning = Boolean(versionDeletions && versionDeletions.length > 0);
-  const schemaVersion = options.schemaVersion ?? (hasVersioning ? "1.2" : "1.1");
+  const schemaVersion = options.schemaVersion ?? "1.3";
 
   const plan: Plan = {
     schemaVersion,
@@ -138,6 +145,14 @@ export function createPlan(options: CreatePlanOptions): Plan {
     plan.versioningMonthlyWasteUSD = calculateMonthlyCostUSD(versioningBytes);
   }
 
+  if (options.blastRadiusAudit) {
+    plan.blastRadiusAudit = options.blastRadiusAudit;
+  }
+
+  if (plan.schemaVersion === "1.3") {
+    plan.planHash = computePlanHash(plan);
+  }
+
   const totalTargeted = totalZombieUploads + (plan.versionDeletions?.length ?? 0);
   if (totalTargeted > HIGH_VOLUME_THRESHOLD) {
     plan.highVolumeWarning = HIGH_VOLUME_WARNING;
@@ -147,7 +162,7 @@ export function createPlan(options: CreatePlanOptions): Plan {
 }
 
 /**
- * Validates that an arbitrary JSON object conforms to Plan schema 1.0, 1.1, or 1.2.
+ * Validates that an arbitrary JSON object conforms to Plan schema 1.0, 1.1, 1.2, or 1.3.
  * Schema 1.0 plans are up-converted to 1.1 with safe defaults.
  */
 export function validatePlan(data: unknown): Plan {
@@ -160,10 +175,11 @@ export function validatePlan(data: unknown): Plan {
   if (
     obj.schemaVersion !== "1.0" &&
     obj.schemaVersion !== "1.1" &&
-    obj.schemaVersion !== "1.2"
+    obj.schemaVersion !== "1.2" &&
+    obj.schemaVersion !== "1.3"
   ) {
     throw new Error(
-      `Unsupported plan schemaVersion: "${obj.schemaVersion}". Expected "1.0", "1.1", or "1.2".`
+      `Unsupported plan schemaVersion: "${obj.schemaVersion}". Expected "1.0", "1.1", "1.2", or "1.3".`
     );
   }
 
@@ -278,10 +294,12 @@ export function validatePlan(data: unknown): Plan {
         : undefined,
   };
 
-  const schemaVersion =
-    obj.schemaVersion === "1.2" || validatedVersions.length > 0
-      ? "1.2"
-      : "1.1";
+  let schemaVersion: "1.1" | "1.2" | "1.3" = "1.1";
+  if (obj.schemaVersion === "1.3") {
+    schemaVersion = "1.3";
+  } else if (obj.schemaVersion === "1.2" || validatedVersions.length > 0) {
+    schemaVersion = "1.2";
+  }
 
   const plan: Plan = {
     schemaVersion,
@@ -298,6 +316,14 @@ export function validatePlan(data: unknown): Plan {
     lifecycleAudit,
     uploads: validatedUploads,
   };
+
+  if (typeof obj.planHash === "string") {
+    plan.planHash = obj.planHash;
+  }
+
+  if (obj.blastRadiusAudit && typeof obj.blastRadiusAudit === "object") {
+    plan.blastRadiusAudit = obj.blastRadiusAudit as BlastRadiusAssessment;
+  }
 
   if (validatedVersions.length > 0) {
     const noncurrent = validatedVersions.filter((v) => v.type === "NONCURRENT_VERSION");
@@ -317,6 +343,40 @@ export function validatePlan(data: unknown): Plan {
   }
 
   return plan;
+}
+
+/**
+ * Cryptographically verifies plan integrity against RFC 8785 SHA-256 target hash.
+ * Returns valid: true if hash matches or if plan is legacy schema without hash.
+ * Returns valid: false if hash is missing on schema 1.3 or if calculated hash differs.
+ */
+export function verifyPlanIntegrity(plan: Plan): { valid: boolean; error?: string } {
+  if (plan.schemaVersion === "1.3") {
+    if (!plan.planHash || typeof plan.planHash !== "string") {
+      return {
+        valid: false,
+        error: "Plan schema 1.3 requires a cryptographic planHash but none was found.",
+      };
+    }
+
+    const calculatedHash = computePlanHash(plan);
+    if (plan.planHash !== calculatedHash) {
+      return {
+        valid: false,
+        error: `Plan integrity verification failed. Expected SHA-256 "${calculatedHash}", found "${plan.planHash}". The plan targets have been altered or corrupted.`,
+      };
+    }
+  } else if (plan.planHash) {
+    const calculatedHash = computePlanHash(plan);
+    if (plan.planHash !== calculatedHash) {
+      return {
+        valid: false,
+        error: `Plan integrity verification failed. Expected SHA-256 "${calculatedHash}", found "${plan.planHash}". The plan targets have been altered or corrupted.`,
+      };
+    }
+  }
+
+  return { valid: true };
 }
 
 function isValidLifecycleStatus(val: unknown): val is LifecycleStatus {

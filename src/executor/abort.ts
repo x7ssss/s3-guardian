@@ -17,6 +17,8 @@ export interface AbortResultItem {
   status: AbortItemStatus;
   bytes: number;
   error?: string;
+  requestId?: string;
+  extendedRequestId?: string;
 }
 
 export interface AbortResult {
@@ -37,7 +39,8 @@ export interface ExecuteOptions {
     completed: number,
     total: number,
     currentItem: ZombieUploadItem,
-    status: AbortItemStatus
+    status: AbortItemStatus,
+    correlation?: { requestId?: string; extendedRequestId?: string }
   ) => void;
 }
 
@@ -104,9 +107,11 @@ export async function executeAbortPlan(
       limiter(async () => {
         let status: AbortItemStatus = "ABORTED";
         let errorMessage: string | undefined = undefined;
+        let requestId: string | undefined = undefined;
+        let extendedRequestId: string | undefined = undefined;
 
         try {
-          await withRetry(
+          const res = await withRetry(
             () =>
               client.send(
                 new AbortMultipartUploadCommand({
@@ -118,6 +123,8 @@ export async function executeAbortPlan(
             options.retryOptions
           );
 
+          requestId = res?.$metadata?.requestId;
+          extendedRequestId = res?.$metadata?.extendedRequestId;
           aborted++;
           bytesFreed += item.bytes;
         } catch (err: unknown) {
@@ -145,8 +152,13 @@ export async function executeAbortPlan(
             status,
             bytes: item.bytes,
             error: errorMessage,
+            requestId,
+            extendedRequestId,
           });
-          options.onProgress?.(completed, total, item, status);
+          options.onProgress?.(completed, total, item, status, {
+            requestId,
+            extendedRequestId,
+          });
         }
       })
     )

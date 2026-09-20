@@ -11,11 +11,23 @@ export interface TargetVersionIdentifier {
   VersionId: string;
 }
 
+export interface CloudTrailCorrelationBatch {
+  requestId?: string;
+  extendedRequestId?: string;
+  batchSize: number;
+  timestamp: string;
+}
+
 export interface VersionExecutorOptions {
   confirm: boolean;
+  bypassGovernance?: boolean;
   batchSize?: number;
   retryOptions?: RetryOptions;
-  onProgress?: (deleted: number, total: number) => void;
+  onProgress?: (
+    deleted: number,
+    total: number,
+    correlation?: { requestId?: string; extendedRequestId?: string }
+  ) => void;
 }
 
 export interface VersionDeletionFailure {
@@ -30,6 +42,7 @@ export interface VersionExecutionResult {
   deleted: number;
   failed: number;
   errors: VersionDeletionFailure[];
+  correlations?: CloudTrailCorrelationBatch[];
 }
 
 const MAX_BATCH_SIZE = 1000;
@@ -73,6 +86,7 @@ export async function executeVersionDeletion(
 
   let totalDeleted = 0;
   const allErrors: VersionDeletionFailure[] = [];
+  const correlations: CloudTrailCorrelationBatch[] = [];
 
   for (let i = 0; i < entries.length; i += batchSize) {
     const chunk = entries.slice(i, i + batchSize);
@@ -87,26 +101,38 @@ export async function executeVersionDeletion(
         VersionId: e.VersionId === "null" ? "null" : e.VersionId,
       }));
 
+      const deleteParams = {
+        Bucket: bucket,
+        Delete: {
+          Objects: s3Objects,
+          Quiet: true,
+        },
+        ...(options.bypassGovernance === true ? { BypassGovernanceRetention: true } : {}),
+      };
+
       const response: DeleteObjectsCommandOutput = await withRetry(
-        () =>
-          client.send(
-            new DeleteObjectsCommand({
-              Bucket: bucket,
-              Delete: {
-                Objects: s3Objects,
-                Quiet: true,
-              },
-            })
-          ),
+        () => client.send(new DeleteObjectsCommand(deleteParams)),
         options.retryOptions
       );
+
+      const requestId = response.$metadata?.requestId;
+      const extendedRequestId = response.$metadata?.extendedRequestId;
+      correlations.push({
+        requestId,
+        extendedRequestId,
+        batchSize: s3Objects.length,
+        timestamp: new Date().toISOString(),
+      });
 
       const batchErrors = response.Errors ?? [];
 
       if (batchErrors.length === 0) {
         // Entire sub-batch succeeded
         totalDeleted += itemsToProcess.length;
-        options.onProgress?.(totalDeleted, entries.length);
+        options.onProgress?.(totalDeleted, entries.length, {
+          requestId,
+          extendedRequestId,
+        });
         break;
       }
 
@@ -131,7 +157,10 @@ export async function executeVersionDeletion(
 
       const succeededThisPass = itemsToProcess.length - batchErrors.length;
       totalDeleted += Math.max(0, succeededThisPass);
-      options.onProgress?.(totalDeleted, entries.length);
+      options.onProgress?.(totalDeleted, entries.length, {
+        requestId,
+        extendedRequestId,
+      });
 
       if (transientItems.length > 0 && attempt <= maxRetries) {
         itemsToProcess = transientItems;
@@ -149,5 +178,6 @@ export async function executeVersionDeletion(
     deleted: totalDeleted,
     failed: allErrors.length,
     errors: allErrors,
+    correlations,
   };
 }

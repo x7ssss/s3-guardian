@@ -67,6 +67,7 @@ describe("Planner and Plan Schema", () => {
       uploads: rawUploads,
       lifecycleAudit: emptyLifecycleAudit,
       generatedAt: "2026-09-20T12:00:00.000Z",
+      schemaVersion: "1.1",
     });
 
     expect(plan.schemaVersion).toBe("1.1");

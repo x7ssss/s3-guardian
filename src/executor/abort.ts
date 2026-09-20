@@ -6,6 +6,8 @@ import { S3Provider } from "../providers/detector.js";
 import { evaluateMutationCeiling } from "../safety/mutation-budget.js";
 import { executeCanaryGate, CanaryVerificationError } from "../safety/canary.js";
 import { CircuitBreaker } from "../circuit/breaker.js";
+import { createDeletionCertificate } from "../rollback/manifest-generator.js";
+import { DeletionCertificate } from "../rollback/types.js";
 
 export type AbortItemStatus = "ABORTED" | "SKIPPED_ALREADY_ABORTED" | "FAILED";
 
@@ -34,6 +36,8 @@ export interface AbortResult {
   errors: AbortErrorItem[];
   items?: AbortResultItem[];
   circuitBreaker?: CircuitBreaker;
+  deletionCertificate?: DeletionCertificate;
+  certificatePath?: string;
 }
 
 export interface ExecuteOptions {
@@ -48,6 +52,8 @@ export interface ExecuteOptions {
   maxDeletionPercent?: number;
   skipCanary?: boolean;
   circuitBreaker?: CircuitBreaker;
+  stateDir?: string;
+  planHash?: string;
   onProgress?: (
     completed: number,
     total: number,
@@ -275,6 +281,29 @@ export async function executeAbortPlan(
           }
         }
 
+        let deletionCert: DeletionCertificate | undefined;
+        let certPath: string | undefined;
+        if (aborted > 0) {
+          try {
+            const certRes = await createDeletionCertificate({
+              stateDir: options.stateDir,
+              bucketName: plan.bucket,
+              operation: "ABORT_MULTIPART_UPLOAD",
+              targetCount: aborted,
+              totalBytesReclaimed: bytesFreed,
+              planHash: plan.planHash ?? options.planHash ?? "",
+              requestIds: items.map((i) => i.requestId).filter(Boolean) as string[],
+              itemLedger: items
+                .filter((i) => i.status === "ABORTED")
+                .map((i) => ({ key: i.key, uploadId: i.uploadId, sizeBytes: i.bytes })),
+            });
+            deletionCert = certRes.certificate;
+            certPath = certRes.certificatePath;
+          } catch (cErr) {
+            console.error("[s3-guardian:certificate] Failed to write deletion certificate:", cErr);
+          }
+        }
+
         return {
           total,
           aborted,
@@ -284,6 +313,8 @@ export async function executeAbortPlan(
           errors,
           items,
           circuitBreaker: breaker,
+          deletionCertificate: deletionCert,
+          certificatePath: certPath,
         };
       }
       throw err;
@@ -383,6 +414,29 @@ export async function executeAbortPlan(
     )
   );
 
+  let deletionCertificate: DeletionCertificate | undefined;
+  let certificatePath: string | undefined;
+  if (aborted > 0) {
+    try {
+      const certRes = await createDeletionCertificate({
+        stateDir: options.stateDir,
+        bucketName: plan.bucket,
+        operation: "ABORT_MULTIPART_UPLOAD",
+        targetCount: aborted,
+        totalBytesReclaimed: bytesFreed,
+        planHash: plan.planHash ?? options.planHash ?? "",
+        requestIds: items.map((i) => i.requestId).filter(Boolean) as string[],
+        itemLedger: items
+          .filter((i) => i.status === "ABORTED")
+          .map((i) => ({ key: i.key, uploadId: i.uploadId, sizeBytes: i.bytes })),
+      });
+      deletionCertificate = certRes.certificate;
+      certificatePath = certRes.certificatePath;
+    } catch (cErr) {
+      console.error("[s3-guardian:certificate] Failed to write deletion certificate:", cErr);
+    }
+  }
+
   return {
     total,
     aborted,
@@ -392,5 +446,7 @@ export async function executeAbortPlan(
     errors,
     items,
     circuitBreaker: breaker,
+    deletionCertificate,
+    certificatePath,
   };
 }

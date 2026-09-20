@@ -280,6 +280,30 @@ export {
   renderDashboard,
   launchDashboard,
 } from "./tui/index.js";
+export {
+  UndoManifest,
+  DeletionCertificate,
+  RemoteStateDriftError,
+  RollbackResult,
+  StateCaptureResult,
+  MutationType,
+  InverseCommandType,
+  IrreversibleOperation,
+  DeletionCertificateLedgerItem,
+  captureLifecyclePreState,
+  captureTaggingPreState,
+  createUndoManifest,
+  createDeletionCertificate,
+  computeCanonicalStateHash,
+  paginateListObjectVersions,
+  rehydrateSoftDeletes,
+  executeRollback,
+  RehydrateOptions,
+  RehydrateResult,
+  CreateUndoManifestParams,
+  CreateDeletionCertificateParams,
+  ExecuteRollbackOptions,
+} from "./rollback/index.js";
 
 
 

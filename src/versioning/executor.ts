@@ -9,11 +9,16 @@ import { S3Provider } from "../providers/detector.js";
 import { evaluateMutationCeiling } from "../safety/mutation-budget.js";
 import { executeCanaryGate, CanaryVerificationError } from "../safety/canary.js";
 import { CircuitBreaker } from "../circuit/breaker.js";
+import { createDeletionCertificate } from "../rollback/manifest-generator.js";
+import { DeletionCertificate } from "../rollback/types.js";
+import { computeSha256Hex, canonicalizeJson } from "../planner/jcs.js";
 
 export interface TargetVersionIdentifier {
   Key: string;
   VersionId: string;
   LastModified?: string | Date;
+  sizeBytes?: number;
+  size?: number;
 }
 
 export interface CloudTrailCorrelationBatch {
@@ -36,6 +41,8 @@ export interface VersionExecutorOptions {
   maxDeletionPercent?: number;
   skipCanary?: boolean;
   circuitBreaker?: CircuitBreaker;
+  stateDir?: string;
+  planHash?: string;
   onProgress?: (
     deleted: number,
     total: number,
@@ -57,6 +64,8 @@ export interface VersionExecutionResult {
   errors: VersionDeletionFailure[];
   correlations?: CloudTrailCorrelationBatch[];
   circuitBreaker?: CircuitBreaker;
+  deletionCertificate?: DeletionCertificate;
+  certificatePath?: string;
 }
 
 const MAX_BATCH_SIZE = 1000;
@@ -190,6 +199,47 @@ export async function executeVersionDeletion(
             });
           }
         }
+        let deletionCert: DeletionCertificate | undefined;
+        let certPath: string | undefined;
+        if (totalDeleted > 0) {
+          try {
+            const failedSet = new Set(allErrors.map((e) => `${e.Key}::${e.VersionId}`));
+            const deletedEntries = entries
+              .filter((e) => !failedSet.has(`${e.Key}::${e.VersionId}`))
+              .slice(0, totalDeleted);
+            const totalBytes = deletedEntries.reduce(
+              (sum, e) => sum + (e.sizeBytes ?? e.size ?? 0),
+              0
+            );
+            const planHash =
+              options.planHash ??
+              computeSha256Hex(
+                canonicalizeJson({
+                  bucket,
+                  entries: entries.map((e) => ({ key: e.Key, versionId: e.VersionId })),
+                })
+              );
+            const certRes = await createDeletionCertificate({
+              stateDir: options.stateDir,
+              bucketName: bucket,
+              operation: "PERMANENT_VERSION_DELETE",
+              targetCount: totalDeleted,
+              totalBytesReclaimed: totalBytes,
+              planHash,
+              requestIds: correlations.map((c) => c.requestId).filter(Boolean) as string[],
+              itemLedger: deletedEntries.map((e) => ({
+                key: e.Key,
+                versionId: e.VersionId,
+                sizeBytes: e.sizeBytes ?? e.size ?? 0,
+              })),
+            });
+            deletionCert = certRes.certificate;
+            certPath = certRes.certificatePath;
+          } catch (cErr) {
+            console.error("[s3-guardian:certificate] Failed to write deletion certificate:", cErr);
+          }
+        }
+
         return {
           total: entries.length,
           deleted: totalDeleted,
@@ -197,6 +247,8 @@ export async function executeVersionDeletion(
           errors: allErrors,
           correlations,
           circuitBreaker: breaker,
+          deletionCertificate: deletionCert,
+          certificatePath: certPath,
         };
       }
       throw err;
@@ -312,6 +364,47 @@ export async function executeVersionDeletion(
     }
   }
 
+  let deletionCertificate: DeletionCertificate | undefined;
+  let certificatePath: string | undefined;
+  if (totalDeleted > 0) {
+    try {
+      const failedSet = new Set(allErrors.map((e) => `${e.Key}::${e.VersionId}`));
+      const deletedEntries = entries
+        .filter((e) => !failedSet.has(`${e.Key}::${e.VersionId}`))
+        .slice(0, totalDeleted);
+      const totalBytes = deletedEntries.reduce(
+        (sum, e) => sum + (e.sizeBytes ?? e.size ?? 0),
+        0
+      );
+      const planHash =
+        options.planHash ??
+        computeSha256Hex(
+          canonicalizeJson({
+            bucket,
+            entries: entries.map((e) => ({ key: e.Key, versionId: e.VersionId })),
+          })
+        );
+      const certRes = await createDeletionCertificate({
+        stateDir: options.stateDir,
+        bucketName: bucket,
+        operation: "PERMANENT_VERSION_DELETE",
+        targetCount: totalDeleted,
+        totalBytesReclaimed: totalBytes,
+        planHash,
+        requestIds: correlations.map((c) => c.requestId).filter(Boolean) as string[],
+        itemLedger: deletedEntries.map((e) => ({
+          key: e.Key,
+          versionId: e.VersionId,
+          sizeBytes: e.sizeBytes ?? e.size ?? 0,
+        })),
+      });
+      deletionCertificate = certRes.certificate;
+      certificatePath = certRes.certificatePath;
+    } catch (cErr) {
+      console.error("[s3-guardian:certificate] Failed to write deletion certificate:", cErr);
+    }
+  }
+
   return {
     total: entries.length,
     deleted: totalDeleted,
@@ -319,5 +412,7 @@ export async function executeVersionDeletion(
     errors: allErrors,
     correlations,
     circuitBreaker: breaker,
+    deletionCertificate,
+    certificatePath,
   };
 }

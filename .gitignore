@@ -5,3 +5,4 @@ plan.json
 .env
 coverage/
 .DS_Store
+.s3-guardian/

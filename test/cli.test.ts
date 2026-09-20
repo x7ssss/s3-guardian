@@ -12,6 +12,7 @@ import {
   ListObjectVersionsCommand,
   DeleteObjectsCommand,
   ListObjectsV2Command,
+  DeleteBucketLifecycleCommand,
 } from "@aws-sdk/client-s3";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { OrganizationsClient, ListAccountsCommand } from "@aws-sdk/client-organizations";
@@ -20,6 +21,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { main } from "../src/cli.js";
 import { Plan, writePlanFile } from "../src/planner/plan.js";
+import { createUndoManifest, createDeletionCertificate } from "../src/rollback/index.js";
 
 const s3Mock = mockClient(S3Client);
 const stsMock = mockClient(STSClient);
@@ -67,7 +69,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.7.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.8.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1742,6 +1744,166 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
         await fs.unlink(tempPlanFile).catch(() => {});
         await fs.rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
       }
+    });
+  });
+
+  describe("Rollback, Certificate, and Rehydrate Subcommands (v1.8.0)", () => {
+    let tempDir: string;
+
+    beforeEach(async () => {
+      tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "s3-guardian-cli-v180-"));
+    });
+
+    afterEach(async () => {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    });
+
+    it("rollback returns 2 when manifest path is missing", async () => {
+      const code = await main(["rollback"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("<manifest-path> is required");
+    });
+
+    it("rollback executes successfully and outputs restoration summary", async () => {
+      const preRules = [{ ID: "orig", Status: "Enabled" as const }];
+      const postRules = [{ ID: "orig", Status: "Enabled" as const }, { ID: "s3-guardian-abort-mpu", Status: "Enabled" as const }];
+
+      const manifestRes = await createUndoManifest({
+        stateDir: tempDir,
+        bucketName: "rollback-bucket",
+        mutationType: "LIFECYCLE_CONFIGURATION",
+        preState: { Rules: preRules },
+        postState: { Rules: postRules },
+        appliedPlanHash: "hash-plan-test",
+      });
+
+      s3Mock
+        .on(GetBucketLifecycleConfigurationCommand, { Bucket: "rollback-bucket" })
+        .resolves({ Rules: postRules });
+      s3Mock
+        .on(PutBucketLifecycleConfigurationCommand, { Bucket: "rollback-bucket" })
+        .resolves({});
+
+      const code = await main(["rollback", manifestRes.manifestPath, "--state-dir", tempDir], captureIO);
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Rollback Restored Successfully");
+      expect(stdoutLogs.join(" ")).toContain("rollback-bucket");
+    });
+
+    it("rollback halts on remote state drift and succeeds with --force", async () => {
+      const preRules = [{ ID: "orig" }];
+      const postRules = [{ ID: "orig" }, { ID: "s3-guardian-abort-mpu" }];
+
+      const manifestRes = await createUndoManifest({
+        stateDir: tempDir,
+        bucketName: "drift-bucket",
+        mutationType: "LIFECYCLE_CONFIGURATION",
+        preState: { Rules: preRules },
+        postState: { Rules: postRules },
+        appliedPlanHash: "hash-drift-plan",
+      });
+
+      // Divergent live state
+      s3Mock
+        .on(GetBucketLifecycleConfigurationCommand, { Bucket: "drift-bucket" })
+        .resolves({ Rules: [{ ID: "someone-else-modified-this" }] });
+
+      // 1. Without --force -> halts with exit code 1
+      const codeHalt = await main(["rollback", manifestRes.manifestPath, "--state-dir", tempDir], captureIO);
+      expect(codeHalt).toBe(1);
+      expect(stderrLogs.join(" ")).toContain("Remote state drift detected");
+      expect(stderrLogs.join(" ")).toContain("--force");
+
+      // 2. With --force -> succeeds
+      s3Mock
+        .on(PutBucketLifecycleConfigurationCommand, { Bucket: "drift-bucket" })
+        .resolves({});
+
+      const codeForce = await main(["rollback", manifestRes.manifestPath, "--force", "--json", "--state-dir", tempDir], captureIO);
+      expect(codeForce).toBe(0);
+      const jsonOutput = JSON.parse(stdoutLogs.find((l) => l.includes('"status": "RESTORED"')) ?? "{}");
+      expect(jsonOutput.status).toBe("RESTORED");
+    });
+
+    it("certificate returns 2 when cert path is missing", async () => {
+      const code = await main(["certificate"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("<cert-path> is required");
+    });
+
+    it("certificate formats and displays SOC 2 deletion certificate and supports --json", async () => {
+      const certRes = await createDeletionCertificate({
+        stateDir: tempDir,
+        bucketName: "audit-cert-bucket",
+        operation: "PERMANENT_VERSION_DELETE",
+        totalBytesReclaimed: 2048,
+        planHash: "plan-hash-crypto-soc2",
+        requestIds: ["req-soc2-1"],
+        itemLedger: [{ key: "old/data.csv", versionId: "v-1", sizeBytes: 2048 }],
+      });
+
+      // Human table format
+      const code = await main(["certificate", certRes.certificatePath], captureIO);
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Deletion Certificate");
+      expect(stdoutLogs.join(" ")).toContain("audit-cert-bucket");
+      expect(stdoutLogs.join(" ")).toContain("plan-hash-crypto-soc2");
+      expect(stdoutLogs.join(" ")).toContain("req-soc2-1");
+
+      // JSON format
+      const codeJson = await main(["certificate", certRes.certificatePath, "--json"], captureIO);
+      expect(codeJson).toBe(0);
+      const jsonOut = JSON.parse(stdoutLogs.find((l) => l.includes('"planHash": "plan-hash-crypto-soc2"')) ?? "{}");
+      expect(jsonOut.planHash).toBe("plan-hash-crypto-soc2");
+      expect(jsonOut.bucketName).toBe("audit-cert-bucket");
+    });
+
+    it("rehydrate returns 2 when bucket is omitted", async () => {
+      const code = await main(["rehydrate"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("<bucket> is required");
+    });
+
+    it("rehydrate dry-run discovers delete markers without popping tombstones", async () => {
+      s3Mock.on(ListObjectVersionsCommand, { Bucket: "rehydrate-dry-bucket" }).resolvesOnce({
+        DeleteMarkers: [
+          { Key: "file.txt", VersionId: "dm-dry-1", IsLatest: true, LastModified: new Date() },
+        ],
+        Versions: [
+          { Key: "file.txt", VersionId: "v-prev", IsLatest: false },
+        ],
+        IsTruncated: false,
+      });
+
+      const code = await main(["rehydrate", "rehydrate-dry-bucket", "--dry-run"], captureIO);
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Rehydration Simulation (DRY RUN)");
+      expect(stdoutLogs.join(" ")).toContain("No changes were made");
+      expect(s3Mock.commandCalls(DeleteObjectsCommand).length).toBe(0);
+    });
+
+    it("rehydrate removes Delete Markers and un-deletes hidden data versions", async () => {
+      s3Mock.on(ListObjectVersionsCommand, { Bucket: "rehydrate-live-bucket" }).resolvesOnce({
+        DeleteMarkers: [
+          { Key: "important.doc", VersionId: "dm-pop-1", IsLatest: true, LastModified: new Date() },
+        ],
+        Versions: [
+          { Key: "important.doc", VersionId: "v-good", IsLatest: false },
+        ],
+        IsTruncated: false,
+      });
+
+      s3Mock.on(DeleteObjectsCommand, { Bucket: "rehydrate-live-bucket" }).resolvesOnce({
+        $metadata: { requestId: "req-rehydrate-pop" },
+        Deleted: [{ Key: "important.doc", VersionId: "dm-pop-1" }],
+      });
+
+      const code = await main(["rehydrate", "rehydrate-live-bucket", "--json"], captureIO);
+      expect(code).toBe(0);
+      const jsonOut = JSON.parse(stdoutLogs.find((l) => l.includes('"restoredCount": 1')) ?? "{}");
+      expect(jsonOut.restoredCount).toBe(1);
+      expect(jsonOut.deletedMarkers[0].VersionId).toBe("dm-pop-1");
+      expect(s3Mock.commandCalls(DeleteObjectsCommand).length).toBe(1);
     });
   });
 });

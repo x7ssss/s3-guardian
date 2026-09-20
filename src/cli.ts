@@ -64,11 +64,17 @@ import {
   getBucketHistory,
   createAuditEvent,
 } from "./state/index.js";
+import {
+  executeRollback,
+  RemoteStateDriftError,
+  rehydrateSoftDeletes,
+  DeletionCertificate,
+} from "./rollback/index.js";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 
-const VERSION = "1.7.0";
+const VERSION = "1.8.0";
 
 
 const HELP_TEXT = `
@@ -99,6 +105,9 @@ USAGE:
   s3-guardian tui [options]
   s3-guardian state compact [options]
   s3-guardian state history <bucket> [options]
+  s3-guardian rollback <manifest-path> [options]
+  s3-guardian certificate <cert-path> [options]
+  s3-guardian rehydrate <bucket> [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -116,10 +125,15 @@ COMMANDS:
   dashboard               Interactive terminal dashboard (TUI) for fleet storage governance (alias: tui)
   state compact           Compact audit.jsonl into a compressed snapshot and rotate log
   state history <bucket>  Inspect historical aggregated metrics from snapshots and audit log
+  rollback <manifest-path> Invert mutation from UndoManifest with cryptographic state verification
+  certificate <cert-path> Format and display SOC 2 / ISO 27001 immutable deletion certificate
+  rehydrate <bucket>      Safely pop Delete Markers to un-delete and restore hidden object versions
 
 OPTIONS:
   --state-dir <path>           Local state directory for audit.jsonl and snapshots (default: .s3-guardian)
   --s3-mirror <bucket>         Target S3 bucket to mirror compressed audit snapshots
+  --force                      Force rollback execution even if remote state has diverged
+  --dry-run                    Simulate soft delete rehydration without deleting Delete Markers
   --lens <source>              Initialize dashboard triage with Storage Lens CSV export
   --tf-file <path>             Target Terraform .tf file to compare against
   --tfstate <path>             Target terraform.tfstate JSON file
@@ -732,6 +746,8 @@ export async function main(
         lens: { type: "string" },
         "state-dir": { type: "string" },
         "s3-mirror": { type: "string" },
+        force: { type: "boolean", default: false },
+        "dry-run": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -776,10 +792,13 @@ export async function main(
   }
 
   const olderThanStr = getString(values["older-than"]) ?? "7";
-  const olderThanDays = parseInt(olderThanStr, 10);
-  if (isNaN(olderThanDays) || olderThanDays < 0) {
-    error("Error: --older-than must be a non-negative integer");
-    return EXIT_CODES.ARG_ERROR;
+  let olderThanDays = 7;
+  if (command !== "rehydrate") {
+    olderThanDays = parseInt(olderThanStr, 10);
+    if (isNaN(olderThanDays) || olderThanDays < 0) {
+      error("Error: --older-than must be a non-negative integer");
+      return EXIT_CODES.ARG_ERROR;
+    }
   }
 
   const region = getString(values.region);
@@ -2891,6 +2910,142 @@ export async function main(
 
       error(`Error: Unknown state subcommand '${subCmd || ""}'. Usage: s3-guardian state <compact|history> [options]`);
       return EXIT_CODES.ARG_ERROR;
+    }
+
+    // ── ROLLBACK ──────────────────────────────────────────────────────────────
+    case "rollback": {
+      const manifestPath = positionals[1];
+      if (!manifestPath) {
+        error("Error: <manifest-path> is required for 'rollback'. Usage: s3-guardian rollback <manifest-path> [options]");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      const client = createS3Client(clientConfig);
+      const force = values.force === true;
+      const stateDir = getString(values["state-dir"]);
+
+      try {
+        const result = await executeRollback(client, manifestPath, {
+          force,
+          stateDir,
+        });
+
+        if (isJson) {
+          log(JSON.stringify(result, null, 2));
+          return EXIT_CODES.SUCCESS;
+        }
+
+        log(`\n🔄 Rollback Restored Successfully:`);
+        log(`  Manifest ID:       ${result.manifestId}`);
+        log(`  Bucket:            ${result.bucketName}`);
+        log(`  Status:            ${result.status}`);
+        log(`  Restored At:       ${result.restoredAt}`);
+        return EXIT_CODES.SUCCESS;
+      } catch (err: unknown) {
+        if (err instanceof RemoteStateDriftError) {
+          error(`\n❌ Remote state drift detected for bucket '${err.bucketName}':`);
+          error(`   Expected post-state hash: ${err.expectedHash}`);
+          error(`   Live remote state hash:   ${err.actualHash}`);
+          error(`   Pass '--force' to override and force rollback execution.`);
+          return EXIT_CODES.POLICY_VIOLATION;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        error(`\n❌ Rollback error: ${msg}`);
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+    }
+
+    // ── CERTIFICATE ───────────────────────────────────────────────────────────
+    case "certificate": {
+      const certPath = positionals[1];
+      if (!certPath) {
+        error("Error: <cert-path> is required for 'certificate'. Usage: s3-guardian certificate <cert-path> [options]");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      try {
+        const content = await fsPromises.readFile(certPath, "utf8");
+        const cert = JSON.parse(content) as DeletionCertificate;
+
+        if (isJson) {
+          log(JSON.stringify(cert, null, 2));
+          return EXIT_CODES.SUCCESS;
+        }
+
+        log(`\n📜 SOC 2 CC6.8 / ISO 27001 A.8.10 Deletion Certificate:`);
+        log(`  Certificate ID:       ${cert.certificateId}`);
+        log(`  Timestamp:            ${cert.timestamp}`);
+        log(`  Bucket:               ${cert.bucketName}`);
+        log(`  Operation:            ${cert.operation}`);
+        log(`  Items Targeted:       ${cert.targetCount}`);
+        log(`  Storage Reclaimed:    ${formatBytes(cert.totalBytesReclaimed)}`);
+        log(`  Plan Hash:            ${cert.planHash}`);
+        log(`  AWS Request IDs:      ${cert.requestIds?.length > 0 ? cert.requestIds.join(", ") : "None"}`);
+        log(`  Ledger Records:       ${cert.itemLedger?.length ?? 0} item(s)`);
+        if (cert.itemLedger && cert.itemLedger.length > 0) {
+          log(`\n  Item Ledger (first ${Math.min(5, cert.itemLedger.length)} shown):`);
+          for (const item of cert.itemLedger.slice(0, 5)) {
+            const idStr = item.versionId ? ` (VersionId: ${item.versionId})` : item.uploadId ? ` (UploadId: ${item.uploadId})` : "";
+            const sizeStr = item.sizeBytes !== undefined ? ` [${formatBytes(item.sizeBytes)}]` : "";
+            log(`    - ${item.key}${idStr}${sizeStr}`);
+          }
+          if (cert.itemLedger.length > 5) {
+            log(`    ... and ${cert.itemLedger.length - 5} more item(s)`);
+          }
+        }
+        return EXIT_CODES.SUCCESS;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        error(`\n❌ Failed to read certificate: ${msg}`);
+        return EXIT_CODES.ARG_ERROR;
+      }
+    }
+
+    // ── REHYDRATE ─────────────────────────────────────────────────────────────
+    case "rehydrate": {
+      const targetBucket =
+        (typeof positionals[1] === "string" ? positionals[1] : undefined) ||
+        getString(values.bucket);
+
+      if (!targetBucket) {
+        error("Error: <bucket> is required for 'rehydrate'. Usage: s3-guardian rehydrate <bucket> [options]");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      const client = createS3Client(clientConfig);
+      const isDryRun = values["dry-run"] === true;
+      const olderThanArg = argv.includes("--older-than") ? getString(values["older-than"]) : undefined;
+
+      try {
+        const result = await rehydrateSoftDeletes(client, targetBucket, {
+          dryRun: isDryRun,
+          olderThan: olderThanArg,
+        });
+
+        if (isJson) {
+          log(JSON.stringify(result, null, 2));
+          return EXIT_CODES.SUCCESS;
+        }
+
+        if (isDryRun) {
+          log(`\n🔍 Soft Delete Rehydration Simulation (DRY RUN) for '${targetBucket}':`);
+          log(`  Delete Markers Found:   ${result.discoveredMarkersCount}`);
+          log(`  Restorable Versions:    ${result.restoredVersions.filter(v => v.activeVersionId).length}`);
+          log(`  No changes were made.`);
+        } else {
+          log(`\n✨ Soft Delete Rehydration Completed for '${targetBucket}':`);
+          log(`  Delete Markers Popped:  ${result.restoredCount}`);
+          log(`  Active Versions:        ${result.restoredVersions.filter(v => v.activeVersionId).length}`);
+          if (result.requestIds.length > 0) {
+            log(`  AWS Request IDs:        ${result.requestIds.join(", ")}`);
+          }
+        }
+        return EXIT_CODES.SUCCESS;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        error(`\n❌ Rehydration error: ${msg}`);
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
     }
 
     default: {

@@ -5,7 +5,8 @@ export type AuditEventType =
   | "BLAST_RADIUS_ASSESSMENT"
   | "CANARY_VERIFIED"
   | "REMEDIATION_EXECUTED"
-  | "CIRCUIT_BREAKER_TRIPPED";
+  | "CIRCUIT_BREAKER_TRIPPED"
+  | "REMEDIATION_ROLLED_BACK";
 
 export interface AuditEvent {
   eventId: string; // UUIDv4

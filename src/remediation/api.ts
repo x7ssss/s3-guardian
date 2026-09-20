@@ -5,11 +5,16 @@ import {
   LifecycleRule,
 } from "@aws-sdk/client-s3";
 import { withRetry, RetryOptions } from "../utils/retry.js";
+import { captureLifecyclePreState, createUndoManifest } from "../rollback/manifest-generator.js";
+import { UndoManifest } from "../rollback/types.js";
+import { computeSha256Hex, canonicalizeJson } from "../planner/jcs.js";
 
 export interface DirectApplyOptions {
   daysAfterInitiation?: number;
   dangerDirectApiApply?: boolean;
   retryOptions?: RetryOptions;
+  stateDir?: string;
+  appliedPlanHash?: string;
 }
 
 export interface ApplyLifecycleResult {
@@ -19,6 +24,8 @@ export interface ApplyLifecycleResult {
   action: "CREATED" | "UPDATED";
   preservedRuleIds: string[];
   ghostRuleWarning?: string;
+  undoManifest?: UndoManifest;
+  manifestPath?: string;
 }
 
 export const TARGET_RULE_ID = "s3-guardian-abort-mpu";
@@ -55,31 +62,9 @@ export async function applyLifecycleRuleDirectly(
     );
   }
 
-  // 1. Fetch existing lifecycle configuration
-  let existingRules: LifecycleRule[] = [];
-  try {
-    const response = await withRetry(
-      () =>
-        client.send(
-          new GetBucketLifecycleConfigurationCommand({ Bucket: bucket })
-        ),
-      options.retryOptions
-    );
-    existingRules = response.Rules ?? [];
-  } catch (err: unknown) {
-    const errorObj = err as Record<string, unknown>;
-    const name = String(errorObj?.name || "");
-    const status =
-      (errorObj?.$metadata as Record<string, unknown> | undefined)
-        ?.httpStatusCode ?? errorObj?.statusCode;
-
-    // Gracefully handle buckets without an existing lifecycle policy
-    if (name === "NoSuchLifecycleConfiguration" || status === 404) {
-      existingRules = [];
-    } else {
-      throw err;
-    }
-  }
+  // 1. Fetch existing lifecycle configuration & pre-state
+  const preStateCapture = await captureLifecyclePreState(client, bucket);
+  const existingRules: LifecycleRule[] = preStateCapture.preState?.Rules ?? [];
 
   // 2. Check for ghost rules among existing rules
   let ghostRuleWarning: string | undefined;
@@ -121,7 +106,7 @@ export async function applyLifecycleRuleDirectly(
   }
 
   // 5. Apply the updated lifecycle configuration
-  await withRetry(
+  const putResponse = await withRetry(
     () =>
       client.send(
         new PutBucketLifecycleConfigurationCommand({
@@ -134,6 +119,26 @@ export async function applyLifecycleRuleDirectly(
     options.retryOptions
   );
 
+  let undoManifest: UndoManifest | undefined;
+  let manifestPath: string | undefined;
+  try {
+    const manifestRes = await createUndoManifest({
+      stateDir: options.stateDir,
+      bucketName: bucket,
+      mutationType: "LIFECYCLE_CONFIGURATION",
+      preState: preStateCapture.preState,
+      postState: { Rules: mergedRules },
+      appliedPlanHash:
+        options.appliedPlanHash ??
+        computeSha256Hex(canonicalizeJson({ bucket, rules: mergedRules })),
+      requestIds: putResponse?.$metadata?.requestId ? [putResponse.$metadata.requestId] : [],
+    });
+    undoManifest = manifestRes.manifest;
+    manifestPath = manifestRes.manifestPath;
+  } catch (mErr) {
+    console.error("[s3-guardian:rollback] Failed to write undo manifest:", mErr);
+  }
+
   const preservedRuleIds = existingRules
     .filter((r) => r.ID !== TARGET_RULE_ID)
     .map((r) => r.ID ?? "(unnamed)");
@@ -145,5 +150,7 @@ export async function applyLifecycleRuleDirectly(
     action,
     preservedRuleIds,
     ghostRuleWarning,
+    undoManifest,
+    manifestPath,
   };
 }

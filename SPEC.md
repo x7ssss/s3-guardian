@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.7.0  
+**Version:** 1.8.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -521,3 +521,91 @@ Long-running daemon deployments accumulate high-volume audit event logs. The com
 - **Global Flags:**
   - `--state-dir <path>`: Custom state directory for audit logging and snapshots (defaults to `./.s3-guardian`).
   - `--s3-mirror <bucket>`: S3 bucket for mirror uploads of state snapshots.
+
+---
+
+## 16. Cryptographic Rollback Engine, Undo Manifests, Soft Delete Re-hydration & SOC 2 Deletion Certificates
+
+### 16.1 Explicit Reversibility Taxonomy
+All storage governance operations in `s3-guardian` are explicitly partitioned into two cryptographic domains:
+1. **Reversible Mutations:**
+   - Bucket lifecycle configuration modifications (`PutBucketLifecycleConfiguration`, `DeleteBucketLifecycleConfiguration`).
+   - Bucket tagging mutations (`PutBucketTagging`, `DeleteBucketTagging`).
+   - Soft Delete Marker cleanups (deleting tombstones restores the underlying data version as the active version).
+   - *Requirement:* Must capture full pre-state and post-state, generating an atomic `UndoManifest`.
+2. **Irreversible Operations:**
+   - Permanent object version purges (`DeleteObjects` / `DeleteObject` with specific `VersionId`).
+   - Aborted Multipart Uploads (`AbortMultipartUpload`).
+   - *Requirement (SOC 2 CC6.8 / ISO 27001 A.8.10):* Because byte recovery is physically impossible once purged, every execution must generate an immutable, cryptographically sealed `DeletionCertificate`.
+
+### 16.2 Undo Manifest Specification (`UndoManifest`)
+Every reversible mutation automatically creates an immutable manifest written atomically to `${stateDir}/undo/undo-<bucket>-<timestamp>.json`:
+
+```typescript
+interface UndoManifest {
+  manifestId: string;             // UUIDv4
+  manifestVersion: "1.8.0";
+  createdAt: string;              // ISO 8601 UTC timestamp
+  bucketName: string;
+  mutationType: 'LIFECYCLE_CONFIGURATION' | 'BUCKET_TAGGING' | 'SOFT_DELETE_MARKER';
+  canonicalPreStateHash: string;  // 64-char hex SHA-256 (RFC 8785 JCS)
+  canonicalPostStateHash: string; // 64-char hex SHA-256 (RFC 8785 JCS)
+  preState: any;                  // null if 404 NoSuchLifecycleConfiguration or NoSuchTagSet
+  postState: any;
+  inverseCommandType: 'PutBucketLifecycleConfiguration' | 'DeleteBucketLifecycleConfiguration' | 'PutBucketTagging' | 'DeleteBucketTagging' | 'DeleteObjects';
+  inversePayload: any;
+  appliedPlanHash: string;
+  requestIds: string[];
+}
+```
+
+### 16.3 Remote State Drift Verification & Rollback Execution
+When executing `s3-guardian rollback <manifest-path>`:
+1. **Cryptographic State Verification (RFC 8785):**
+   - Fetches live remote state directly from AWS S3 (`GetBucketLifecycleConfigurationCommand` or `GetBucketTaggingCommand`).
+   - Normalizes and hashes live state using RFC 8785 canonical JSON and SHA-256.
+   - Compares the live hash against `manifest.canonicalPostStateHash`.
+   - If divergent, execution halts immediately by throwing `RemoteStateDriftError`.
+   - Halting can only be bypassed by explicit operator override via `--force`.
+2. **Deterministic State Inversion:**
+   - Executes the inverse command (`PutBucketLifecycleConfiguration` / `DeleteBucketLifecycle` / `PutBucketTagging` / `DeleteBucketTagging` / `DeleteObjects`) using `manifest.preState`.
+3. **Audit Ledger Non-Repudiation:**
+   - Emits a `REMEDIATION_ROLLED_BACK` event to `${stateDir}/audit.jsonl` recording `manifestId`, `appliedPlanHash`, and `forced` status.
+
+### 16.4 Soft Delete Tombstone Popping (`rehydrateSoftDeletes`)
+AWS S3 soft deletes place a Delete Marker on top of the object version stack.
+- **Dual-Marker Pagination:** Streams all object versions and delete markers via `paginateListObjectVersions`.
+- **Target Filtering:** Targets markers where `marker.IsLatest === true` and optionally filters by timestamp threshold (`--older-than <timestamp>`).
+- **Tombstone Popping:** Deletes targeted markers via `DeleteObjectsCommand` with `Quiet: true`, supplying explicit `{ Key, VersionId }`.
+- **Activation Confirmation:** Once the tombstone Delete Marker is permanently deleted, the preceding data version is restored and elevated to active `IsLatest = true` status.
+- **Dry-Run Simulation:** `--dry-run` discovers candidate markers and maps restorable versions without issuing destructive API calls.
+
+### 16.5 SOC 2 CC6.8 / ISO 27001 A.8.10 Immutable Deletion Certificates
+Irreversible version purges and aborted multipart uploads generate an unforgeable compliance record written atomically to `${stateDir}/certificates/deletion-certificate-<bucket>-<timestamp>.json`:
+
+```typescript
+interface DeletionCertificate {
+  certificateId: string;         // UUIDv4
+  timestamp: string;             // ISO 8601 UTC timestamp
+  bucketName: string;
+  operation: 'PERMANENT_VERSION_DELETE' | 'ABORT_MULTIPART_UPLOAD';
+  targetCount: number;
+  totalBytesReclaimed: number;
+  planHash: string;              // Cryptographic plan SHA-256
+  requestIds: string[];          // AWS CloudTrail request IDs
+  itemLedger: Array<{
+    key: string;
+    versionId?: string;
+    uploadId?: string;
+    sizeBytes?: number;
+  }>;
+}
+```
+
+### 16.6 CLI Command Interfaces
+- **`s3-guardian rollback <manifest-path> [--force] [--json] [--state-dir <path>]`:**
+  Verifies remote configuration state, inverts recorded mutations, and restores pre-state.
+- **`s3-guardian certificate <cert-path> [--json]`:**
+  Displays formatted SOC 2 / ISO 27001 deletion certificates with cryptographic planHash and CloudTrail traces.
+- **`s3-guardian rehydrate <bucket> [--dry-run] [--older-than <timestamp>] [--json]`:**
+  Discovers latest Delete Markers and pops tombstones to restore hidden object data versions.

@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.7.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.8.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -461,10 +461,58 @@ s3-guardian state history production-data-lake --json
 
 ---
 
+## Cryptographic Rollback Engine, Soft Delete Re-hydration & SOC 2 Certificates (v1.8.0)
+
+### 12. `rollback`: Cryptographic State Inversion with Remote Drift Verification
+Inverts reversible mutations (lifecycle configuration updates, bucket tagging updates, soft delete markers) recorded in an `UndoManifest`. Computes live remote state hashes via RFC 8785 canonical JSON and SHA-256, halting on divergence unless `--force` is passed:
+
+```bash
+# Verify live remote state and rollback mutation
+s3-guardian rollback .s3-guardian/undo/undo-my-bucket-2026-09-20T17-00-00.json
+
+# Force rollback execution despite live remote state drift
+s3-guardian rollback .s3-guardian/undo/undo-my-bucket-2026-09-20T17-00-00.json --force
+
+# Output machine-readable JSON restoration summary
+s3-guardian rollback .s3-guardian/undo/undo-my-bucket-2026-09-20T17-00-00.json --json
+```
+
+### 13. `certificate`: SOC 2 CC6.8 / ISO 27001 A.8.10 Deletion Certificates
+Displays and validates unforgeable deletion certificates generated at the conclusion of permanent object version purges and aborted multipart uploads:
+
+```bash
+# View formatted compliance certificate with item ledger
+s3-guardian certificate .s3-guardian/certificates/deletion-certificate-my-bucket-2026-09-20T17-00-00.json
+
+# Export raw JSON certificate for compliance archiving
+s3-guardian certificate .s3-guardian/certificates/deletion-certificate-my-bucket-2026-09-20T17-00-00.json --json
+```
+
+### 14. `rehydrate`: Soft Delete Tombstone Popping
+Safely un-deletes soft-deleted items by permanently removing latest Delete Markers (`IsLatest === true`) using `DeleteObjectsCommand` with `Quiet: true`, elevating the previous data version to active status:
+
+```bash
+# Simulate soft delete rehydration without deleting markers (dry run)
+s3-guardian rehydrate my-bucket --dry-run
+
+# Rehydrate all soft-deleted objects in the bucket
+s3-guardian rehydrate my-bucket
+
+# Rehydrate delete markers matching an ISO 8601 or interval threshold
+s3-guardian rehydrate my-bucket --older-than 2026-08-01T00:00:00Z --json
+```
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `rollback <manifest>` | command | — | Invert mutation from UndoManifest with RFC 8785 state verification |
+| `certificate <cert>` | command | — | Format and display SOC 2 / ISO 27001 immutable deletion certificate |
+| `rehydrate <bucket>` | command | — | Safely pop Delete Markers to un-delete and restore hidden data versions |
+| `--force` | flag | `false` | Force rollback execution even if remote state has diverged |
+| `--dry-run` | flag | `false` | Simulate soft delete rehydration without deleting Delete Markers |
 | `state compact` | command | — | Compact active audit log into compressed snapshot and rotate log |
 | `state history <bucket>` | command | — | View synthesized historical FinOps metrics and audit events for a bucket |
 | `--state-dir <path>` | string | `.s3-guardian` | Path to persistent state directory for audit ledger and snapshots |

@@ -208,4 +208,19 @@ export {
   MetadataOverheadBreakdown,
   StorageClassConfig,
 } from "./transitions/index.js";
+export {
+  acquireDaemonLock,
+  releaseDaemonLock,
+  getLockFilePath,
+  isPidAlive,
+  DaemonLock,
+  DaemonLockError,
+  startDaemon,
+  parseHumanInterval,
+  formatHumanInterval,
+  DaemonOptions,
+  DaemonTaskResult,
+  DaemonHealthMetrics,
+  DaemonSummary,
+} from "./daemon/index.js";
 

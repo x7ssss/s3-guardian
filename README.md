@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.1.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.2.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -241,10 +241,76 @@ Actionable remediation snippets with `object_size_greater_than = 131072` (128 Ki
 
 ---
 
+### 7. `daemon`: Continuous In-Process Governance Daemon
+
+Runs continuous, automated FinOps and storage governance sweeps without external daemon managers (no `pm2`, no `node-cron`). Built purely on native Node.js 20+ runtime primitives.
+
+#### Core Capabilities:
+- **Drift-Free Monotonic Scheduler:** Calculates loop duration using `process.hrtime.bigint()` and dynamically adjusts sleep interval (`Math.max(0, intervalMs - lastRunDurationMs)`) to eliminate timing drift under heavy API load.
+- **Single-Instance Atomic PID Lockfile:** Writes process PID to `${os.tmpdir()}/s3-guardian-<target>.lock` with atomic `{ flag: 'wx' }`. Automatically detects and reclaims stale locks if the previous process terminated abnormally.
+- **Signal-Safe Graceful Shutdown:** Traps `SIGINT` (Ctrl+C) and `SIGTERM`, allowing in-flight network batches to complete before process exit, and cleanly unlinks lockfiles.
+- **Memory Safety & Resource Monitoring:** Tracks `process.memoryUsage()` (heap used and RSS) on every iteration to guarantee zero memory leaks over long-running deployments.
+- **Continuous Webhook Alerting:** Dispatches real-time summary notifications to Slack, Discord, PagerDuty, or Webhook endpoints after each iteration.
+
+#### CLI Usage Examples:
+
+```bash
+# Continuous fleet scan every 1 hour (default)
+s3-guardian scan --all-buckets --daemon
+
+# Continuous single-bucket monitoring every 30 minutes with Slack alerts
+s3-guardian scan my-bucket --daemon --interval 30m --webhook-url https://hooks.slack.com/services/...
+
+# Continuous lifecycle transition trap monitoring every 12 hours
+s3-guardian audit-transitions --all-buckets --daemon --interval 12h
+
+# Execute exactly one iteration in daemon harness (validates lockfile, pipeline, and metrics)
+s3-guardian scan --all-buckets --once
+```
+
+#### systemd Service Configuration (`/etc/systemd/system/s3-guardian.service`):
+
+```ini
+[Unit]
+Description=s3-guardian Continuous Storage Governance Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=s3guardian
+Group=s3guardian
+Environment=AWS_REGION=us-east-1
+Environment=NODE_ENV=production
+ExecStart=/usr/local/bin/s3-guardian scan --all-buckets --daemon --interval 6h --webhook-url https://hooks.slack.com/services/XXX
+Restart=on-failure
+RestartSec=30s
+KillMode=mixed
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Docker / Container Deployment:
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+RUN npm install -g s3-guardian
+USER node
+ENTRYPOINT ["s3-guardian"]
+CMD ["scan", "--all-buckets", "--daemon", "--interval", "1h"]
+```
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `--daemon` | flag | `false` | Continuous in-process daemon execution mode |
+| `--interval <duration>` | string | `1h` | Interval between daemon runs (`10s`, `30m`, `1h`, `12h`, `24h`) |
+| `--once` | flag | `false` | Run exactly one iteration in daemon harness (validates lock & metrics) |
 | `--older-than <days>` | number | `7` | Age threshold in days for multipart uploads and versions |
 | `--include-versions` | flag | `false` | Scan and plan for noncurrent versions and expired delete markers |
 | `--audit-transitions` | flag | `false` | Audit lifecycle transitions for Glacier/IA small-object traps during scan |

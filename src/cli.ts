@@ -40,6 +40,11 @@ import {
   DangerousTransitionRule,
 } from "./transitions/index.js";
 import {
+  startDaemon,
+  parseHumanInterval,
+  DaemonLockError,
+} from "./daemon/index.js";
+import {
   generateTerraformTransitionRemediation,
   generateCloudFormationTransitionRemediation,
 } from "./remediation/iac.js";
@@ -47,7 +52,7 @@ import { ListBucketsCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3
 import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
 import { matchesExcludePattern } from "./fleet/scanner.js";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning waste, and transition traps
@@ -55,12 +60,16 @@ s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning 
 USAGE:
   s3-guardian scan <bucket> [options]
   s3-guardian scan --all-buckets [options]
+  s3-guardian scan <bucket> --daemon [options]
+  s3-guardian scan --all-buckets --daemon [options]
   s3-guardian scan --org [options]
   s3-guardian scan --accounts <id,id,...> [options]
   s3-guardian scan-versions <bucket> [options]
   s3-guardian scan-versions --org [options]
   s3-guardian audit-transitions <bucket> [options]
   s3-guardian audit-transitions --all-buckets [options]
+  s3-guardian audit-transitions <bucket> --daemon [options]
+  s3-guardian audit-transitions --all-buckets --daemon [options]
   s3-guardian plan <bucket> --out <file> [options]
   s3-guardian plan --all-buckets --out <file> [options]
   s3-guardian plan --org --out <file> [options]
@@ -83,6 +92,9 @@ COMMANDS:
   lens <source>           Zero-overhead triage and ranking from AWS Storage Lens CSV export
 
 OPTIONS:
+  --daemon                     Continuous in-process daemon mode
+  --interval <duration>        Daemon execution interval (e.g. 1h, 30m, 12h, 24h, default: 1h)
+  --once                       Execute exactly one iteration in daemon harness (validates lock & metrics)
   --older-than <days>          Age threshold in days (default: 7)
   --include-versions           Scan and plan for noncurrent versions and expired delete markers
   --audit-transitions          Audit lifecycle transitions for Glacier/IA small-object traps during scan
@@ -145,6 +157,7 @@ SAFETY GUARANTEES:
 export interface CliOptions {
   stdout?: (msg: string) => void;
   stderr?: (msg: string) => void;
+  signal?: AbortSignal;
 }
 
 function getString(val: unknown): string | undefined {
@@ -618,6 +631,9 @@ export async function main(
         "webhook-type": { type: "string" },
         "notify-always": { type: "boolean", default: false },
         checkpoint: { type: "string" },
+        daemon: { type: "boolean", default: false },
+        interval: { type: "string", default: "1h" },
+        once: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -647,6 +663,19 @@ export async function main(
   const bucketArg =
     (typeof positionals[1] === "string" ? positionals[1] : undefined) ||
     getString(values.bucket);
+
+  const isDaemon = values.daemon === true || values.once === true;
+  const isOnce = values.once === true;
+  let daemonIntervalMs = 3600000;
+  const intervalArg = getString(values.interval);
+  if (intervalArg !== undefined) {
+    try {
+      daemonIntervalMs = parseHumanInterval(intervalArg);
+    } catch (err: unknown) {
+      error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      return EXIT_CODES.ARG_ERROR;
+    }
+  }
 
   const olderThanStr = getString(values["older-than"]) ?? "7";
   const olderThanDays = parseInt(olderThanStr, 10);
@@ -832,6 +861,139 @@ export async function main(
 
       // ── Fleet mode: --all-buckets ──────────────────────────────────────────
       if (allBuckets) {
+        if (isDaemon) {
+          try {
+            let lastExitCode: number = EXIT_CODES.SUCCESS;
+            await startDaemon({
+              lockName: "scan-fleet",
+              intervalMs: daemonIntervalMs,
+              maxRuns: isOnce ? 1 : undefined,
+              log,
+              error,
+              signal: io.signal,
+              exitOnSignal: process.env.NODE_ENV !== "test",
+              targetDescription: "Fleet scan (--all-buckets)",
+              task: async (runIndex) => {
+                if (!isJson && !isGitHub) {
+                  log(`\n🔍 Fleet scan (Run #${runIndex}): discovering all account buckets (older than ${olderThanDays} days)...`);
+                }
+
+                const pool = new S3ClientPool();
+                let fleetResult: FleetScanResult;
+                try {
+                  const discoveryClient = createS3Client(clientConfig);
+                  fleetResult = await scanFleet({
+                    olderThanDays,
+                    prefix,
+                    excludeBuckets,
+                    excludeRegions,
+                    endpoint,
+                    discoveryClient,
+                    clientPool: pool,
+                    checkpointUri: checkpoint,
+                    auditTransitions,
+                  });
+                } catch (err) {
+                  if (err instanceof DiscoveryAuthError) {
+                    error(`\n❌ Discovery failed: ${err.message}`);
+                    lastExitCode = EXIT_CODES.DISCOVERY_AUTH_ERROR;
+                    return;
+                  }
+                  throw err;
+                } finally {
+                  await pool.destroy();
+                }
+
+                const policyResult = evaluatePolicy(fleetResult, policyOptions);
+                lastExitCode = policyResult.exitCode;
+
+                if (webhookUrl) {
+                  await dispatchNotification(
+                    {
+                      scope: "fleet",
+                      target: "all-buckets",
+                      totalZombieUploads: fleetResult.totalZombieUploads,
+                      totalStrandedBytes: fleetResult.totalStrandedBytes,
+                      totalEstimatedMonthlyWasteUSD: fleetResult.totalEstimatedMonthlyWasteUSD,
+                      bucketsDiscovered: fleetResult.bucketsDiscovered,
+                      bucketsAudited: fleetResult.bucketsAudited,
+                      bucketsSkipped: fleetResult.bucketsSkipped,
+                      policyViolations: policyResult.violations.map((v) => v.message),
+                    },
+                    {
+                      webhookUrl,
+                      webhookType,
+                      notifyAlways,
+                    }
+                  );
+                }
+
+                if (isJson) {
+                  log(JSON.stringify(fleetResult, null, 2));
+                  return { wasteDetectedUSD: fleetResult.totalEstimatedMonthlyWasteUSD };
+                }
+
+                if (isGitHub) {
+                  renderFleetGitHub(
+                    fleetResult,
+                    policyResult.violations.map((v) => v.message),
+                    log
+                  );
+                  return { wasteDetectedUSD: fleetResult.totalEstimatedMonthlyWasteUSD };
+                }
+
+                log(`\nFleet Scan Summary (Run #${runIndex}):`);
+                log(`  Buckets Discovered:       ${fleetResult.bucketsDiscovered}`);
+                log(`  Buckets Audited:          ${fleetResult.bucketsAudited}`);
+                log(`  Buckets Skipped:          ${fleetResult.bucketsSkipped}`);
+                log(`  Total Zombie Uploads:     ${fleetResult.totalZombieUploads}`);
+                log(`  Total Stranded Storage:   ${formatBytes(fleetResult.totalStrandedBytes)}`);
+                log(`  Estimated Monthly Waste:  ${formatMonthlyCost(fleetResult.totalEstimatedMonthlyWasteUSD)}`);
+                if (auditTransitions && fleetResult.totalTransitionPenaltyUSD !== undefined) {
+                  log(`  Transition Trap Penalty:  ${formatMonthlyCost(fleetResult.totalTransitionPenaltyUSD)}`);
+                }
+                log(``);
+                renderFleetTable(fleetResult, log);
+
+                if (auditTransitions) {
+                  const bucketsWithTraps = fleetResult.bucketResults.filter(
+                    (b) => b.transitionAudit && b.transitionAudit.dangerousRules.length > 0
+                  );
+                  if (bucketsWithTraps.length > 0) {
+                    log(`\n⚠️  Transition Traps detected in ${bucketsWithTraps.length} bucket(s):`);
+                    for (const b of bucketsWithTraps) {
+                      renderTransitionTable(b.transitionAudit!, log);
+                    }
+                  }
+                }
+
+                const hasUnprotectedFleet = fleetResult.bucketResults.some(
+                  (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
+                );
+                if (hasUnprotectedFleet) {
+                  log(`\n💡 Tip: Run \`s3-guardian remediate --all-buckets\` to generate Terraform/CloudFormation fix.`);
+                }
+
+                if (policyResult.violations.length > 0) {
+                  log(`\n❌ Policy violations detected:`);
+                  for (const v of policyResult.violations) {
+                    log(`  [${v.rule}] ${v.message}`);
+                  }
+                }
+
+                return { wasteDetectedUSD: fleetResult.totalEstimatedMonthlyWasteUSD };
+              },
+            });
+            return lastExitCode;
+          } catch (err: unknown) {
+            if (err instanceof DaemonLockError) {
+              error(`\n❌ Daemon lock conflict: ${err.message}`);
+              return EXIT_CODES.ARG_ERROR;
+            }
+            throw err;
+          }
+        }
+
         if (!isJson && !isGitHub) {
           log(`🔍 Fleet scan: discovering all account buckets (older than ${olderThanDays} days)...`);
         }
@@ -945,6 +1107,179 @@ export async function main(
       if (!bucketArg) {
         error("Error: Bucket name is required for 'scan'. Usage: s3-guardian scan <bucket>");
         return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (isDaemon) {
+        try {
+          let lastExitCode: number = EXIT_CODES.SUCCESS;
+          await startDaemon({
+            lockName: `scan-${bucketArg}`,
+            intervalMs: daemonIntervalMs,
+            maxRuns: isOnce ? 1 : undefined,
+            log,
+            error,
+            signal: io.signal,
+            exitOnSignal: process.env.NODE_ENV !== "test",
+            targetDescription: `Bucket scan (${bucketArg})`,
+            task: async (runIndex) => {
+              if (!isJson) {
+                log(`\n🔍 Scanning bucket '${bucketArg}' (Run #${runIndex}) for multipart uploads older than ${olderThanDays} days...`);
+              }
+
+              const client = createS3Client(clientConfig);
+
+              const shouldAuditTransitions = values["audit-transitions"] === true;
+              const [scanResult, lifecycleAudit, versionResult, transitionResult] = await Promise.all([
+                scanMultipartUploads(client, bucketArg, { olderThanDays, endpoint, prefix }),
+                auditBucketLifecycle(client, bucketArg, endpoint),
+                includeVersions
+                  ? scanObjectVersions(client, bucketArg, { olderThanDays, prefix })
+                  : Promise.resolve(null),
+                shouldAuditTransitions
+                  ? auditBucketTransitions(client, bucketArg, { prefix })
+                  : Promise.resolve(null),
+              ]);
+
+              const now = new Date();
+              const enrichedUploads = scanResult.uploads.map((u) => {
+                const coverage = evaluateUploadCoverage(
+                  u.key,
+                  new Date(u.initiated),
+                  lifecycleAudit.mpuRules ?? [],
+                  now
+                );
+                return { ...u, lifecycleStatus: coverage.status };
+              });
+
+              const totalMonthlyWaste =
+                scanResult.estimatedMonthlyWasteUSD +
+                (versionResult ? versionResult.estimatedMonthlyWasteUSD : 0);
+
+              if (webhookUrl) {
+                await dispatchNotification(
+                  {
+                    scope: "bucket",
+                    target: bucketArg,
+                    totalZombieUploads: scanResult.totalZombieUploads,
+                    totalStrandedBytes: scanResult.totalStrandedBytes,
+                    totalEstimatedMonthlyWasteUSD: totalMonthlyWaste,
+                    policyViolations: [],
+                  },
+                  {
+                    webhookUrl,
+                    webhookType,
+                    notifyAlways,
+                  }
+                );
+              }
+
+              if (isJson) {
+                log(
+                  JSON.stringify(
+                    {
+                      ...scanResult,
+                      uploads: enrichedUploads,
+                      lifecycleAudit,
+                      versioning: versionResult ?? undefined,
+                      transitionAudit: transitionResult ?? undefined,
+                    },
+                    null,
+                    2
+                  )
+                );
+                return { wasteDetectedUSD: totalMonthlyWaste };
+              }
+
+              // Lifecycle banner
+              if (lifecycleAudit.providerNotes) {
+                log(`\nℹ️  ${lifecycleAudit.providerNotes}`);
+              } else if (lifecycleAudit.ghostRulesDetected.length > 0) {
+                for (const ghost of lifecycleAudit.ghostRulesDetected) {
+                  log(`\n[!] Ghost rule detected: ${ghost}`);
+                }
+                if (!lifecycleAudit.hasCoveringRule) {
+                  log(`    No valid (non-ghost) lifecycle rule covers multipart uploads.`);
+                }
+                log(`\n💡 Tip: Run \`s3-guardian remediate ${bucketArg}\` to generate Terraform/CloudFormation fix.`);
+              } else if (!lifecycleAudit.hasCoveringRule) {
+                log(`\n[!] Bucket has NO lifecycle rule covering multipart uploads.`);
+                log(`    Zombie uploads will accumulate indefinitely without manual cleanup.`);
+                log(`\n💡 Tip: Run \`s3-guardian remediate ${bucketArg}\` to generate Terraform/CloudFormation fix.`);
+              }
+
+              if (enrichedUploads.length === 0) {
+                log(`\n✅ Clean! No multipart uploads older than ${olderThanDays} days found in '${bucketArg}'.`);
+              } else {
+                log(`\nFound ${scanResult.totalZombieUploads} zombie multipart upload(s):\n`);
+
+                const padKey = 36;
+                const padId = 22;
+                const padInit = 22;
+                const padParts = 8;
+                const padBytes = 14;
+                const padClass = 14;
+                const padCoverage = 16;
+
+                log(
+                  "Key".padEnd(padKey) +
+                  "Upload ID".padEnd(padId) +
+                  "Initiated".padEnd(padInit) +
+                  "Parts".padEnd(padParts) +
+                  "Stranded Bytes".padEnd(padBytes) +
+                  "Storage Class".padEnd(padClass) +
+                  "Coverage".padEnd(padCoverage)
+                );
+                log("-".repeat(padKey + padId + padInit + padParts + padBytes + padClass + padCoverage));
+
+                for (const u of enrichedUploads) {
+                  const shortKey = u.key.length > padKey - 3 ? u.key.slice(0, padKey - 3) + "..." : u.key;
+                  const shortId = u.uploadId.length > padId - 3 ? u.uploadId.slice(0, padId - 3) + "..." : u.uploadId;
+                  const initStr = u.initiated.replace("T", " ").replace(/\.\d+Z$/, "");
+                  const storageClassDisplay =
+                    u.storageClass !== "STANDARD" ? `⚠ ${u.storageClass}` : u.storageClass;
+
+                  log(
+                    shortKey.padEnd(padKey) +
+                    shortId.padEnd(padId) +
+                    initStr.padEnd(padInit) +
+                    String(u.partsCount).padEnd(padParts) +
+                    formatBytes(u.bytes).padEnd(padBytes) +
+                    storageClassDisplay.padEnd(padClass) +
+                    u.lifecycleStatus.padEnd(padCoverage)
+                  );
+                }
+
+                log("\nSummary:");
+                log(`  Zombie Uploads:           ${scanResult.totalZombieUploads}`);
+                log(`  Total Stranded Storage:   ${formatBytes(scanResult.totalStrandedBytes)} (${scanResult.totalStrandedBytes.toLocaleString()} bytes)`);
+                log(`  Estimated Monthly Waste:  ${formatMonthlyCost(scanResult.estimatedMonthlyWasteUSD)} (AWS S3 Standard baseline)`);
+
+                if (scanResult.totalZombieUploads > 10_000) {
+                  log(`\n⚠️  High Volume Warning: Executing apply on >10k uploads will generate substantial CloudTrail Data Events.`);
+                }
+              }
+
+              // Display versioning table if requested
+              if (versionResult) {
+                renderVersioningTable(versionResult, log);
+              }
+
+              // Display transition audit table if requested
+              if (transitionResult) {
+                renderTransitionTable(transitionResult, log);
+              }
+
+              return { wasteDetectedUSD: totalMonthlyWaste };
+            },
+          });
+          return lastExitCode;
+        } catch (err: unknown) {
+          if (err instanceof DaemonLockError) {
+            error(`\n❌ Daemon lock conflict: ${err.message}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+          throw err;
+        }
       }
 
       if (!isJson) {
@@ -1105,6 +1440,126 @@ export async function main(
     case "audit-transitions": {
       // ── Fleet mode: --all-buckets ──────────────────────────────────────────
       if (allBuckets) {
+        if (isDaemon) {
+          try {
+            let lastExitCode: number = EXIT_CODES.SUCCESS;
+            await startDaemon({
+              lockName: "audit-transitions-fleet",
+              intervalMs: daemonIntervalMs,
+              maxRuns: isOnce ? 1 : undefined,
+              log,
+              error,
+              signal: io.signal,
+              exitOnSignal: process.env.NODE_ENV !== "test",
+              targetDescription: "Fleet transition audit (--all-buckets)",
+              task: async (runIndex) => {
+                if (!isJson) {
+                  log(`\n🔍 Fleet transition audit (Run #${runIndex}): discovering all account buckets...`);
+                }
+
+                const pool = new S3ClientPool();
+                const discoveryClient = createS3Client(clientConfig);
+
+                let allBucketsList: Array<{ Name?: string }>;
+                try {
+                  const listRes = await discoveryClient.send(new ListBucketsCommand({}));
+                  allBucketsList = listRes.Buckets ?? [];
+                } catch (err) {
+                  error(`\n❌ Bucket discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+                  lastExitCode = EXIT_CODES.DISCOVERY_AUTH_ERROR;
+                  return;
+                }
+
+                const filteredBuckets = allBucketsList.filter((b) => {
+                  if (!b.Name) return false;
+                  if (excludeBuckets.length > 0 && matchesExcludePattern(b.Name, excludeBuckets)) {
+                    return false;
+                  }
+                  return true;
+                });
+
+                const auditResults: BucketTransitionAuditResult[] = [];
+                for (const b of filteredBuckets) {
+                  const bucketName = b.Name!;
+                  try {
+                    let bucketRegion = clientConfig.region;
+                    if (!bucketRegion) {
+                      try {
+                        const locRes = await discoveryClient.send(
+                          new GetBucketLocationCommand({ Bucket: bucketName })
+                        );
+                        bucketRegion = normalizeBucketRegion(locRes.LocationConstraint);
+                      } catch {
+                        bucketRegion = US_EAST_1;
+                      }
+                    }
+                    if (
+                      excludeRegions.length > 0 &&
+                      excludeRegions.some((r) => r.toLowerCase() === (bucketRegion || "").toLowerCase())
+                    ) {
+                      continue;
+                    }
+                    const bucketClient = pool.getClient(bucketRegion || US_EAST_1);
+                    const res = await auditBucketTransitions(bucketClient, bucketName, { prefix });
+                    auditResults.push(res);
+                  } catch {
+                    // gracefully continue fleet scan
+                  }
+                }
+
+                await pool.destroy();
+
+                const totalPenaltyUSD =
+                  Math.round(
+                    auditResults.reduce((sum, r) => sum + r.totalEstimatedPenaltyUSD, 0) * 100
+                  ) / 100;
+
+                const dangerousBuckets = auditResults.filter(
+                  (r) => r.dangerousRules.length > 0
+                );
+
+                if (isJson) {
+                  log(
+                    JSON.stringify(
+                      {
+                        buckets: auditResults,
+                        totalEstimatedPenaltyUSD: totalPenaltyUSD,
+                        bucketsAudited: auditResults.length,
+                        dangerousBucketsCount: dangerousBuckets.length,
+                      },
+                      null,
+                      2
+                    )
+                  );
+                  return { wasteDetectedUSD: totalPenaltyUSD };
+                }
+
+                log(`\nFleet Transition Audit Summary (Run #${runIndex}):`);
+                log(`  Buckets Audited:           ${auditResults.length}`);
+                log(`  Buckets with Traps:        ${dangerousBuckets.length}`);
+                log(`  Total Projected Penalty:   ${formatMonthlyCost(totalPenaltyUSD)}`);
+
+                if (dangerousBuckets.length === 0) {
+                  log(`\n✅ Clean! No transition traps detected across all audited buckets.`);
+                } else {
+                  for (const d of dangerousBuckets) {
+                    renderTransitionTable(d, log);
+                  }
+                }
+
+                return { wasteDetectedUSD: totalPenaltyUSD };
+              },
+            });
+            return lastExitCode;
+          } catch (err: unknown) {
+            if (err instanceof DaemonLockError) {
+              error(`\n❌ Daemon lock conflict: ${err.message}`);
+              return EXIT_CODES.ARG_ERROR;
+            }
+            throw err;
+          }
+        }
+
         if (!isJson) {
           log(`🔍 Fleet transition audit: discovering all account buckets...`);
         }
@@ -1207,6 +1662,50 @@ export async function main(
           "Error: Bucket name is required for 'audit-transitions'. Usage: s3-guardian audit-transitions <bucket>"
         );
         return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (isDaemon) {
+        try {
+          let lastExitCode: number = EXIT_CODES.SUCCESS;
+          await startDaemon({
+            lockName: `audit-transitions-${bucketArg}`,
+            intervalMs: daemonIntervalMs,
+            maxRuns: isOnce ? 1 : undefined,
+            log,
+            error,
+            signal: io.signal,
+            exitOnSignal: process.env.NODE_ENV !== "test",
+            targetDescription: `Bucket transition audit (${bucketArg})`,
+            task: async (runIndex) => {
+              if (!isJson) {
+                log(`\n🔍 Auditing lifecycle transitions in bucket '${bucketArg}' (Run #${runIndex})...`);
+              }
+
+              const client = createS3Client(clientConfig);
+              const auditResult = await auditBucketTransitions(client, bucketArg, { prefix });
+
+              if (isJson) {
+                log(JSON.stringify(auditResult, null, 2));
+                return { wasteDetectedUSD: auditResult.totalEstimatedPenaltyUSD };
+              }
+
+              if (!auditResult.hasLifecyclePolicy) {
+                log(`\nℹ️  Bucket '${bucketArg}' has no lifecycle configuration.`);
+                return { wasteDetectedUSD: 0 };
+              }
+
+              renderTransitionTable(auditResult, log);
+              return { wasteDetectedUSD: auditResult.totalEstimatedPenaltyUSD };
+            },
+          });
+          return lastExitCode;
+        } catch (err: unknown) {
+          if (err instanceof DaemonLockError) {
+            error(`\n❌ Daemon lock conflict: ${err.message}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+          throw err;
+        }
       }
 
       if (!isJson) {

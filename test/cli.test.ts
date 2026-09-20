@@ -67,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.1.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.2.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1121,6 +1121,62 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(tableOutput).toContain("Target Tier");
     expect(tableOutput).toContain("scan-transition-rule");
     expect(tableOutput).toContain("Actionable Tip: Small-object transition traps detected!");
+  });
+
+  it("rejects invalid --interval format with exit code 2", async () => {
+    const code = await main(["scan", "test-bucket", "--interval", "invalid-time"], captureIO);
+    expect(code).toBe(2);
+    expect(stderrLogs.join(" ")).toContain("Invalid interval format");
+  });
+
+  it("executes single-bucket scan in daemon mode with --once", async () => {
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      Uploads: [],
+    });
+    stubCoveringLifecycle();
+
+    const code = await main(["scan", "daemon-bucket", "--daemon", "--once"], captureIO);
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("[DAEMON] [STARTUP]");
+    expect(output).toContain("Target: Bucket scan (daemon-bucket)");
+    expect(output).toContain("[DAEMON] [RUN #1]");
+    expect(output).toContain("Clean! No multipart uploads");
+  });
+
+  it("reports daemon lock conflict with exit code 2 when lock already held", async () => {
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      Uploads: [],
+    });
+    stubCoveringLifecycle();
+
+    const lockPath = path.join(os.tmpdir(), "s3-guardian-scan-conflict_bucket.lock");
+    await fs.writeFile(lockPath, `${process.pid}\n`, { flag: "w" });
+
+    try {
+      const code = await main(["scan", "conflict_bucket", "--daemon", "--once"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("Daemon lock conflict");
+    } finally {
+      try {
+        await fs.unlink(lockPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  it("executes audit-transitions in daemon mode with --once", async () => {
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+      Rules: [],
+    });
+
+    const code = await main(["audit-transitions", "trans-bucket", "--daemon", "--once"], captureIO);
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("[DAEMON] [STARTUP]");
+    expect(output).toContain("Target: Bucket transition audit (trans-bucket)");
+    expect(output).toContain("[DAEMON] [RUN #1]");
   });
 });
 

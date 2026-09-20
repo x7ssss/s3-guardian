@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.1.0  
+**Version:** 1.2.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -273,3 +273,40 @@ The `auditBucketTransitions` engine inspects all enabled `LifecycleRule` element
 To eliminate drift and ensure GitOps compliance:
 - Lifecycle remediation generators automatically inject `object_size_greater_than = 131072` (Terraform) and `ObjectSizeGreaterThan: 131072` (CloudFormation) inside rule filters when transition targets are specified.
 - Dedicated remediation generators (`generateTerraformTransitionRemediation`, `generateCloudFormationTransitionRemediation`) emit drop-in HCL / YAML snippets to instantly constrain unconstrained existing transition rules.
+
+---
+
+## 10. Continuous In-Process Daemon & Governance Engine Specification (v1.2.0)
+
+### 10.1 Architecture & Native Invariants
+`s3-guardian` provides a continuous storage governance and FinOps daemon designed for resilient production environments:
+1. **Zero External Daemon Dependencies:** Strictly zero external scheduler or process manager libraries (no `node-cron`, no `pm2`, no external daemon packages). Operates 100% on Node.js 20+ runtime primitives (`process.hrtime.bigint()`, `process.memoryUsage()`, `os.tmpdir()`, and native `node:fs`).
+2. **Signal-Safe Process Control:** Traps `SIGINT` (Ctrl+C) and `SIGTERM`, allowing in-flight network requests, multi-bucket audits, and version scans to finish before closing connections and exiting.
+3. **Memory Safety & Non-Leaking Resource Management:** Tracks heap and resident set size (RSS) across runs to detect and prevent memory leaks during long-running daemon execution.
+
+### 10.2 Drift-Free Monotonic Scheduler
+Standard interval scheduling via `setInterval` or fixed `setTimeout(interval)` drifts cumulatively over time by the execution duration of each run. `s3-guardian` implements a drift-free monotonic scheduling algorithm:
+1. **High-Resolution Monotonic Delta Timing:** Captures start and finish timestamps using `process.hrtime.bigint()` in nanoseconds.
+2. **Drift Elimination:**
+   $$\text{RunDurationMs} = \frac{\text{EndHr} - \text{StartHr}}{1,000,000}$$
+   $$\text{NextDelayMs} = \max(0, \text{IntervalMs} - \text{RunDurationMs}) + \text{JitterMs}$$
+   If an audit takes longer than the interval, `NextDelayMs` collapses to 0, running immediately without queue explosion or task starvation.
+3. **Interruptible Sleep with AbortSignal:** The sleep mechanism hooks to an `AbortSignal`. When a termination signal (`SIGINT`, `SIGTERM`, or internal abort) is received during sleep, the timer aborts immediately without blocking process termination until the interval expires.
+
+### 10.3 Single-Instance Atomic PID Lockfile Protocol
+To prevent concurrent conflicting daemon runs on the same system:
+1. **Deterministic Path:** Lockfiles are located at `${os.tmpdir()}/s3-guardian-${sanitizedLockName}.lock`.
+2. **Atomic Creation:** Locks are acquired using `fs.writeFileSync(path, pid, { flag: 'wx' })`. If the file already exists, it fails with `EEXIST`.
+3. **Stale Lock Detection & Reclamation:**
+   - On `EEXIST`, the existing PID is read from the lockfile.
+   - Process aliveness is evaluated via `process.kill(pid, 0)`.
+   - If the error code is `ESRCH` (No such process), the process has died without releasing the lock (e.g. killed by SIGKILL or machine reboot).
+   - The stale lockfile is cleanly unlinked and reacquired atomically.
+   - If `process.kill(pid, 0)` succeeds or fails with `EPERM`, the process is active, and `DaemonLockError` is thrown, aborting the duplicate run with exit code 2.
+4. **Lifecycle Hooks:** An `exit` listener removes the lockfile synchronously on process exit. Normal clean termination removes both the listener and lockfile.
+
+### 10.4 CLI Flags & Orchestration Modes
+- `--daemon`: Enables continuous in-process execution.
+- `--interval <duration>`: Configures schedule interval. Accepts human shorthand: `10s`, `30m`, `1h`, `12h`, `24h`, `500ms`, or raw milliseconds.
+- `--once`: Executes exactly one iteration in the daemon harness (useful for validating lock acquisition, execution pipeline, and metrics in CI/CD or smoke testing).
+- Supported commands: `scan <bucket> --daemon`, `scan --all-buckets --daemon`, `audit-transitions <bucket> --daemon`, `audit-transitions --all-buckets --daemon`.

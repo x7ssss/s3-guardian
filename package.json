@@ -1,10 +1,10 @@
 {
   "name": "s3-guardian",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first zero-runtime-dependency CLI to scan, quantify, and safely clean up zombie S3 multipart uploads",
   "type": "module",
   "bin": {
-    "s3-guardian": "./dist/cli.js"
+    "s3-guardian": "dist/cli.js"
   },
   "files": [
     "dist"

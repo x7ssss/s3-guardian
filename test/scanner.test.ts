@@ -7,6 +7,7 @@ import {
 } from "@aws-sdk/client-s3";
 import {
   scanMultipartUploads,
+  scanMultipartUploadsStream,
   getUploadPartsInfo,
 } from "../src/scanner/multipart.js";
 
@@ -384,5 +385,220 @@ describe("Scanner: multipart uploads & parts pagination", () => {
 
     expect(result.totalZombieUploads).toBe(15);
     expect(maxObservedConcurrency).toBeLessThanOrEqual(10);
+  });
+
+  it("scanMultipartUploads exposes storageClass from ListMultipartUploads", async () => {
+    const s3Client = new S3Client({});
+    const now = new Date("2026-09-20T12:00:00.000Z");
+    const oldDate = new Date("2026-09-01T00:00:00.000Z");
+
+    s3Mock.on(ListMultipartUploadsCommand).resolvesOnce({
+      IsTruncated: false,
+      Uploads: [
+        {
+          Key: "glacier-file.bin",
+          UploadId: "uid-glacier",
+          Initiated: oldDate,
+          StorageClass: "GLACIER",
+        },
+        {
+          Key: "standard-file.bin",
+          UploadId: "uid-std",
+          Initiated: oldDate,
+          // StorageClass omitted → should default to "STANDARD"
+        },
+      ],
+    });
+
+    s3Mock.on(ListPartsCommand).resolves({
+      IsTruncated: false,
+      Parts: [{ PartNumber: 1, Size: 500 }],
+    });
+
+    const result = await scanMultipartUploads(s3Client, "my-bucket", {
+      now,
+      olderThanDays: 7,
+      retryOptions: { initialDelayMs: 1 },
+    });
+
+    expect(result.totalZombieUploads).toBe(2);
+    const glacierItem = result.uploads.find((u) => u.key === "glacier-file.bin");
+    const standardItem = result.uploads.find((u) => u.key === "standard-file.bin");
+    expect(glacierItem?.storageClass).toBe("GLACIER");
+    expect(standardItem?.storageClass).toBe("STANDARD");
+  });
+});
+
+describe("Scanner: scanMultipartUploadsStream async generator", () => {
+  beforeEach(() => {
+    s3Mock.reset();
+  });
+
+  it("yields uploads page-by-page without accumulating all in memory", async () => {
+    const s3Client = new S3Client({});
+    const now = new Date("2026-09-20T12:00:00.000Z");
+    const oldDate = new Date("2026-09-01T00:00:00.000Z");
+
+    // Page 1
+    s3Mock
+      .on(ListMultipartUploadsCommand, {
+        Bucket: "stream-bucket",
+        KeyMarker: undefined,
+        UploadIdMarker: undefined,
+      })
+      .resolvesOnce({
+        IsTruncated: true,
+        NextKeyMarker: "page1.bin",
+        NextUploadIdMarker: "uid-page1",
+        Uploads: [
+          { Key: "page1.bin", UploadId: "uid-page1", Initiated: oldDate },
+        ],
+      });
+
+    // Page 2
+    s3Mock
+      .on(ListMultipartUploadsCommand, {
+        Bucket: "stream-bucket",
+        KeyMarker: "page1.bin",
+        UploadIdMarker: "uid-page1",
+      })
+      .resolvesOnce({
+        IsTruncated: false,
+        Uploads: [
+          { Key: "page2.bin", UploadId: "uid-page2", Initiated: oldDate },
+        ],
+      });
+
+    const yielded: string[] = [];
+    for await (const item of scanMultipartUploadsStream(s3Client, "stream-bucket", {
+      now,
+      olderThanDays: 7,
+    })) {
+      yielded.push(item.key);
+    }
+
+    expect(yielded).toEqual(["page1.bin", "page2.bin"]);
+    expect(s3Mock.commandCalls(ListMultipartUploadsCommand).length).toBe(2);
+  });
+
+  it("yields only uploads older than olderThanDays, skipping fresh ones", async () => {
+    const s3Client = new S3Client({});
+    const now = new Date("2026-09-20T12:00:00.000Z");
+
+    s3Mock.on(ListMultipartUploadsCommand).resolvesOnce({
+      IsTruncated: false,
+      Uploads: [
+        {
+          Key: "old.bin",
+          UploadId: "uid-old",
+          Initiated: new Date("2026-09-01T00:00:00.000Z"), // 19 days old
+        },
+        {
+          Key: "fresh.bin",
+          UploadId: "uid-fresh",
+          Initiated: new Date("2026-09-19T00:00:00.000Z"), // 1 day old
+        },
+      ],
+    });
+
+    const yielded: string[] = [];
+    for await (const item of scanMultipartUploadsStream(s3Client, "stream-bucket", {
+      now,
+      olderThanDays: 7,
+    })) {
+      yielded.push(item.key);
+    }
+
+    expect(yielded).toEqual(["old.bin"]);
+  });
+
+  it("yields the StorageClass field correctly from ListMultipartUploads", async () => {
+    const s3Client = new S3Client({});
+    const now = new Date("2026-09-20T12:00:00.000Z");
+    const oldDate = new Date("2026-09-01T00:00:00.000Z");
+
+    s3Mock.on(ListMultipartUploadsCommand).resolvesOnce({
+      IsTruncated: false,
+      Uploads: [
+        {
+          Key: "cold.bin",
+          UploadId: "uid-cold",
+          Initiated: oldDate,
+          StorageClass: "GLACIER",
+        },
+        {
+          Key: "standard.bin",
+          UploadId: "uid-std",
+          Initiated: oldDate,
+          // StorageClass omitted → should default to "STANDARD"
+        },
+      ],
+    });
+
+    const items: Array<{ key: string; storageClass: string }> = [];
+    for await (const item of scanMultipartUploadsStream(s3Client, "stream-bucket", {
+      now,
+      olderThanDays: 7,
+    })) {
+      items.push({ key: item.key, storageClass: item.storageClass });
+    }
+
+    expect(items).toHaveLength(2);
+    expect(items.find((i) => i.key === "cold.bin")?.storageClass).toBe("GLACIER");
+    expect(items.find((i) => i.key === "standard.bin")?.storageClass).toBe("STANDARD");
+  });
+
+  it("stops immediately on empty page (not truncated)", async () => {
+    const s3Client = new S3Client({});
+    const now = new Date("2026-09-20T12:00:00.000Z");
+
+    s3Mock.on(ListMultipartUploadsCommand).resolvesOnce({
+      IsTruncated: false,
+      Uploads: [],
+    });
+
+    const items = [];
+    for await (const item of scanMultipartUploadsStream(s3Client, "empty-bucket", { now })) {
+      items.push(item);
+    }
+
+    expect(items).toHaveLength(0);
+    expect(s3Mock.commandCalls(ListMultipartUploadsCommand).length).toBe(1);
+  });
+
+  it("applies prefix filter option to ListMultipartUploads", async () => {
+    const s3Client = new S3Client({});
+    const now = new Date("2026-09-20T12:00:00.000Z");
+    const oldDate = new Date("2026-09-01T00:00:00.000Z");
+
+    s3Mock
+      .on(ListMultipartUploadsCommand, {
+        Bucket: "prefix-bucket",
+        Prefix: "uploads/",
+      })
+      .resolvesOnce({
+        IsTruncated: false,
+        Uploads: [
+          { Key: "uploads/file.bin", UploadId: "uid-1", Initiated: oldDate },
+        ],
+      });
+
+    const items = [];
+    for await (const item of scanMultipartUploadsStream(s3Client, "prefix-bucket", {
+      now,
+      olderThanDays: 7,
+      prefix: "uploads/",
+    })) {
+      items.push(item);
+    }
+
+    expect(items).toHaveLength(1);
+    expect(items[0].key).toBe("uploads/file.bin");
+    // Verify the mock was called with correct prefix
+    const calls = s3Mock.commandCalls(ListMultipartUploadsCommand);
+    expect(calls.length).toBeGreaterThan(0);
+    // The first call should have the prefix in its input
+    const firstCallInput = calls[0].args[0].input;
+    expect(firstCallInput.Prefix).toBe("uploads/");
   });
 });

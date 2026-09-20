@@ -1,6 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { calculateMonthlyCostUSD } from "../cost/estimator.js";
+import type { LifecycleAuditResult } from "../lifecycle/audit.js";
+
+export type LifecycleStatus =
+  | "UNPROTECTED"
+  | "COVERED"
+  | "COVERED_LAGGING"
+  | "GHOST_RULE";
 
 export interface ZombieUploadItem {
   key: string;
@@ -8,10 +15,14 @@ export interface ZombieUploadItem {
   initiated: string;
   partsCount: number;
   bytes: number;
+  /** StorageClass reported by ListMultipartUploads. Non-STANDARD tiers bleed at S3 Standard rates. */
+  storageClass: string;
+  /** Lifecycle protection status for this specific upload's key */
+  lifecycleStatus: LifecycleStatus;
 }
 
 export interface Plan {
-  schemaVersion: "1.0";
+  schemaVersion: "1.1";
   generatedAt: string;
   bucket: string;
   endpoint: string | null;
@@ -19,6 +30,14 @@ export interface Plan {
   totalZombieUploads: number;
   totalStrandedBytes: number;
   estimatedMonthlyWasteUSD: number;
+  lifecycleAudit: {
+    bucketHasLifecyclePolicy: boolean;
+    hasCoveringRule: boolean;
+    ghostRulesDetected: string[];
+    providerNotes?: string;
+  };
+  /** Only present when totalZombieUploads > 10,000 */
+  highVolumeWarning?: string;
   uploads: ZombieUploadItem[];
 }
 
@@ -27,14 +46,21 @@ export interface CreatePlanOptions {
   endpoint?: string | null;
   olderThanDays: number;
   uploads: ZombieUploadItem[];
+  lifecycleAudit: LifecycleAuditResult;
   generatedAt?: string;
 }
 
+const HIGH_VOLUME_THRESHOLD = 10_000;
+const HIGH_VOLUME_WARNING =
+  "Executing apply on >10k uploads will generate substantial CloudTrail Data Events.";
+
 /**
- * Creates a deterministic Plan object with sorted uploads and calculated cost metrics.
+ * Creates a deterministic Plan object (schema 1.1) with sorted uploads,
+ * calculated cost metrics, lifecycle audit summary, and optional high-volume warning.
  */
 export function createPlan(options: CreatePlanOptions): Plan {
-  const { bucket, endpoint = null, olderThanDays, generatedAt } = options;
+  const { bucket, endpoint = null, olderThanDays, generatedAt, lifecycleAudit } =
+    options;
 
   // Deterministic sorting: sort primarily by key, secondarily by uploadId
   const sortedUploads = [...options.uploads].sort((a, b) => {
@@ -50,8 +76,8 @@ export function createPlan(options: CreatePlanOptions): Plan {
   );
   const estimatedMonthlyWasteUSD = calculateMonthlyCostUSD(totalStrandedBytes);
 
-  return {
-    schemaVersion: "1.0",
+  const plan: Plan = {
+    schemaVersion: "1.1",
     generatedAt: generatedAt ?? new Date().toISOString(),
     bucket,
     endpoint: endpoint ?? null,
@@ -59,12 +85,25 @@ export function createPlan(options: CreatePlanOptions): Plan {
     totalZombieUploads,
     totalStrandedBytes,
     estimatedMonthlyWasteUSD,
+    lifecycleAudit: {
+      bucketHasLifecyclePolicy: lifecycleAudit.bucketHasLifecyclePolicy,
+      hasCoveringRule: lifecycleAudit.hasCoveringRule,
+      ghostRulesDetected: lifecycleAudit.ghostRulesDetected,
+      providerNotes: lifecycleAudit.providerNotes,
+    },
     uploads: sortedUploads,
   };
+
+  if (totalZombieUploads > HIGH_VOLUME_THRESHOLD) {
+    plan.highVolumeWarning = HIGH_VOLUME_WARNING;
+  }
+
+  return plan;
 }
 
 /**
- * Validates that an arbitrary JSON object conforms to the Plan schema version 1.0.
+ * Validates that an arbitrary JSON object conforms to either Plan schema 1.0 or 1.1.
+ * Schema 1.0 plans are up-converted to 1.1 with safe defaults.
  */
 export function validatePlan(data: unknown): Plan {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
@@ -73,9 +112,9 @@ export function validatePlan(data: unknown): Plan {
 
   const obj = data as Record<string, unknown>;
 
-  if (obj.schemaVersion !== "1.0") {
+  if (obj.schemaVersion !== "1.0" && obj.schemaVersion !== "1.1") {
     throw new Error(
-      `Unsupported plan schemaVersion: "${obj.schemaVersion}". Expected "1.0".`
+      `Unsupported plan schemaVersion: "${obj.schemaVersion}". Expected "1.0" or "1.1".`
     );
   }
 
@@ -130,11 +169,40 @@ export function validatePlan(data: unknown): Plan {
       initiated: u.initiated,
       partsCount: u.partsCount,
       bytes: u.bytes,
+      // storageClass and lifecycleStatus: safe defaults for 1.0 up-conversion
+      storageClass: typeof u.storageClass === "string" ? u.storageClass : "STANDARD",
+      lifecycleStatus: isValidLifecycleStatus(u.lifecycleStatus)
+        ? u.lifecycleStatus
+        : "UNPROTECTED",
     });
   }
 
-  return {
-    schemaVersion: "1.0",
+  const totalStrandedBytes = validatedUploads.reduce((sum, u) => sum + u.bytes, 0);
+
+  // Lifecycle audit: parse from plan or use safe defaults (for 1.0 up-conversion)
+  const rawAudit = obj.lifecycleAudit as Record<string, unknown> | undefined;
+  const lifecycleAudit = {
+    bucketHasLifecyclePolicy:
+      typeof rawAudit?.bucketHasLifecyclePolicy === "boolean"
+        ? rawAudit.bucketHasLifecyclePolicy
+        : false,
+    hasCoveringRule:
+      typeof rawAudit?.hasCoveringRule === "boolean"
+        ? rawAudit.hasCoveringRule
+        : false,
+    ghostRulesDetected: Array.isArray(rawAudit?.ghostRulesDetected)
+      ? (rawAudit.ghostRulesDetected as string[]).filter(
+          (s) => typeof s === "string"
+        )
+      : [],
+    providerNotes:
+      typeof rawAudit?.providerNotes === "string"
+        ? rawAudit.providerNotes
+        : undefined,
+  };
+
+  const plan: Plan = {
+    schemaVersion: "1.1",
     generatedAt:
       typeof obj.generatedAt === "string"
         ? obj.generatedAt
@@ -149,15 +217,32 @@ export function validatePlan(data: unknown): Plan {
     totalStrandedBytes:
       typeof obj.totalStrandedBytes === "number"
         ? obj.totalStrandedBytes
-        : validatedUploads.reduce((sum, u) => sum + u.bytes, 0),
+        : totalStrandedBytes,
     estimatedMonthlyWasteUSD:
       typeof obj.estimatedMonthlyWasteUSD === "number"
         ? obj.estimatedMonthlyWasteUSD
-        : calculateMonthlyCostUSD(
-            validatedUploads.reduce((sum, u) => sum + u.bytes, 0)
-          ),
+        : calculateMonthlyCostUSD(totalStrandedBytes),
+    lifecycleAudit,
     uploads: validatedUploads,
   };
+
+  if (
+    typeof obj.highVolumeWarning === "string" ||
+    validatedUploads.length > HIGH_VOLUME_THRESHOLD
+  ) {
+    plan.highVolumeWarning = HIGH_VOLUME_WARNING;
+  }
+
+  return plan;
+}
+
+function isValidLifecycleStatus(val: unknown): val is LifecycleStatus {
+  return (
+    val === "UNPROTECTED" ||
+    val === "COVERED" ||
+    val === "COVERED_LAGGING" ||
+    val === "GHOST_RULE"
+  );
 }
 
 /**

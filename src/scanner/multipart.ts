@@ -12,6 +12,8 @@ import { withRetry, RetryOptions } from "../utils/retry.js";
 import { calculateMonthlyCostUSD } from "../cost/estimator.js";
 import { ZombieUploadItem } from "../planner/plan.js";
 
+export type LifecycleStatus = "UNPROTECTED" | "COVERED" | "COVERED_LAGGING" | "GHOST_RULE";
+
 export interface ScanOptions {
   olderThanDays?: number;
   prefix?: string;
@@ -35,6 +37,15 @@ export interface ScanResult {
   totalStrandedBytes: number;
   estimatedMonthlyWasteUSD: number;
   uploads: ZombieUploadItem[];
+}
+
+// ─── Page-level stream item yielded by scanMultipartUploadsStream ─────────────
+
+export interface UploadPageItem {
+  key: string;
+  uploadId: string;
+  initiated: Date;
+  storageClass: string;
 }
 
 /**
@@ -115,30 +126,27 @@ export async function getUploadPartsInfo(
 }
 
 /**
- * Scans a bucket for abandoned multipart uploads older than olderThanDays.
- * Paginates using both KeyMarker and UploadIdMarker.
- * Caps ListParts concurrency to 10.
+ * Streaming async generator that yields candidate uploads page-by-page from
+ * ListMultipartUploads without accumulating them in memory.
+ *
+ * Each yielded item has the raw S3 upload fields plus a resolved StorageClass.
+ * This ensures scanning 100,000+ uploads does not exhaust the V8 heap.
+ *
+ * Paginates using BOTH KeyMarker AND UploadIdMarker per the S3 spec,
+ * with robust fallback to the last upload's Key/UploadId when Next markers are absent.
  */
-export async function scanMultipartUploads(
+export async function* scanMultipartUploadsStream(
   client: S3Client,
   bucket: string,
   options: ScanOptions = {}
-): Promise<ScanResult> {
+): AsyncGenerator<UploadPageItem> {
   const olderThanDays = options.olderThanDays ?? 7;
-  const concurrencyLimit = options.concurrencyLimit ?? 10;
   const now = options.now ?? new Date();
   const cutoffTime = now.getTime() - olderThanDays * 24 * 60 * 60 * 1000;
 
   let keyMarker: string | undefined = undefined;
   let uploadIdMarker: string | undefined = undefined;
 
-  const candidateUploads: Array<{
-    key: string;
-    uploadId: string;
-    initiated: Date;
-  }> = [];
-
-  // Step 1: Paginate ListMultipartUploads using BOTH KeyMarker AND UploadIdMarker
   while (true) {
     const currentKeyMarker: string | undefined = keyMarker;
     const currentUploadIdMarker: string | undefined = uploadIdMarker;
@@ -165,11 +173,12 @@ export async function scanMultipartUploads(
         upload.Initiated &&
         upload.Initiated.getTime() < cutoffTime
       ) {
-        candidateUploads.push({
+        yield {
           key: upload.Key,
           uploadId: upload.UploadId,
           initiated: upload.Initiated,
-        });
+          storageClass: upload.StorageClass ?? "STANDARD",
+        };
       }
     }
 
@@ -180,9 +189,8 @@ export async function scanMultipartUploads(
     const lastUpload =
       uploads.length > 0 ? uploads[uploads.length - 1] : undefined;
 
-    // Real-world S3 edge case: In standard AWS S3 or S3-compatible systems (MinIO, Ceph),
-    // when IsTruncated is true but NextKeyMarker is missing/null/empty, fall back
-    // to the Key and UploadId of the last item in Uploads.
+    // Real-world S3 edge case: when IsTruncated is true but NextKeyMarker is
+    // missing/null/empty, fall back to the Key and UploadId of the last Uploads item.
     const hasNextKeyMarker =
       typeof response.NextKeyMarker === "string" &&
       response.NextKeyMarker.trim().length > 0;
@@ -197,8 +205,7 @@ export async function scanMultipartUploads(
       ? response.NextUploadIdMarker
       : lastUpload?.UploadId;
 
-    // Prevent infinite loops or premature termination:
-    // If no next marker exists, or if markers didn't advance, break.
+    // Prevent infinite loops: if markers didn't advance or can't be resolved, stop.
     if (
       !nextKeyMarker ||
       (nextKeyMarker === currentKeyMarker &&
@@ -210,8 +217,31 @@ export async function scanMultipartUploads(
     keyMarker = nextKeyMarker;
     uploadIdMarker = nextUploadIdMarker;
   }
+}
 
-  // Step 2: Concurrently fetch parts with concurrency capped to 10
+/**
+ * Scans a bucket for abandoned multipart uploads older than olderThanDays.
+ * Uses the streaming generator internally then resolves parts with bounded concurrency.
+ *
+ * Retains the original eager API (returns a full ScanResult) for backwards compatibility
+ * with the plan and apply commands.
+ */
+export async function scanMultipartUploads(
+  client: S3Client,
+  bucket: string,
+  options: ScanOptions = {}
+): Promise<ScanResult> {
+  const olderThanDays = options.olderThanDays ?? 7;
+  const concurrencyLimit = options.concurrencyLimit ?? 10;
+
+  // Drain the streaming generator into a candidate list.
+  // For very large buckets callers should use scanMultipartUploadsStream directly.
+  const candidateUploads: UploadPageItem[] = [];
+  for await (const item of scanMultipartUploadsStream(client, bucket, options)) {
+    candidateUploads.push(item);
+  }
+
+  // Concurrently fetch parts with concurrency capped to 10
   const limiter = createConcurrencyLimiter(concurrencyLimit);
   let completed = 0;
   const total = candidateUploads.length;
@@ -236,6 +266,8 @@ export async function scanMultipartUploads(
           initiated: item.initiated.toISOString(),
           partsCount: partsInfo.partsCount,
           bytes: partsInfo.bytes,
+          storageClass: item.storageClass,
+          lifecycleStatus: "UNPROTECTED", // Default; enriched by lifecycle audit in CLI
         };
       })
     )

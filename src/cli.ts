@@ -5,8 +5,9 @@ import { scanMultipartUploads } from "./scanner/multipart.js";
 import { createPlan, writePlanFile, readPlanFile, Plan } from "./planner/plan.js";
 import { executeAbortPlan } from "./executor/abort.js";
 import { formatBytes, formatMonthlyCost } from "./cost/estimator.js";
+import { auditBucketLifecycle, evaluateUploadCoverage } from "./lifecycle/audit.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads
@@ -132,51 +133,93 @@ export async function main(
       }
 
       const client = createS3Client(clientConfig);
-      const scanResult = await scanMultipartUploads(client, bucket, {
-        olderThanDays,
-        endpoint,
-        prefix,
+
+      // Run scan and lifecycle audit concurrently (both are read-only)
+      const [scanResult, lifecycleAudit] = await Promise.all([
+        scanMultipartUploads(client, bucket, {
+          olderThanDays,
+          endpoint,
+          prefix,
+        }),
+        auditBucketLifecycle(client, bucket, endpoint),
+      ]);
+
+      // Enrich uploads with lifecycle coverage status
+      const now = new Date();
+      const enrichedUploads = scanResult.uploads.map((u) => {
+        const coverage = evaluateUploadCoverage(
+          u.key,
+          new Date(u.initiated),
+          lifecycleAudit.mpuRules ?? [],
+          now
+        );
+        return { ...u, lifecycleStatus: coverage.status };
       });
 
       if (isJson) {
-        log(JSON.stringify(scanResult, null, 2));
+        log(JSON.stringify({ ...scanResult, uploads: enrichedUploads, lifecycleAudit }, null, 2));
         return 0;
       }
 
-      if (scanResult.uploads.length === 0) {
-        log(`✅ Clean! No multipart uploads older than ${olderThanDays} days found in '${bucket}'.`);
+      // ── Lifecycle Banner ───────────────────────────────────────────────────
+      if (lifecycleAudit.providerNotes) {
+        log(`\nℹ️  ${lifecycleAudit.providerNotes}`);
+      } else if (lifecycleAudit.ghostRulesDetected.length > 0) {
+        // Ghost rules take priority: user must know their MPU rule is silently ignored
+        for (const ghost of lifecycleAudit.ghostRulesDetected) {
+          log(`\n[!] Ghost rule detected: ${ghost}`);
+        }
+        if (!lifecycleAudit.hasCoveringRule) {
+          log(`    No valid (non-ghost) lifecycle rule covers multipart uploads.`);
+        }
+      } else if (!lifecycleAudit.hasCoveringRule) {
+        log(`\n[!] Bucket has NO lifecycle rule covering multipart uploads.`);
+        log(`    Zombie uploads will accumulate indefinitely without manual cleanup.`);
+      }
+
+      if (enrichedUploads.length === 0) {
+        log(`\n✅ Clean! No multipart uploads older than ${olderThanDays} days found in '${bucket}'.`);
         return 0;
       }
 
       log(`\nFound ${scanResult.totalZombieUploads} zombie multipart upload(s):\n`);
 
-      // Print table header
-      const padKey = 40;
-      const padId = 24;
+      // Print table header with new columns
+      const padKey = 36;
+      const padId = 22;
       const padInit = 22;
       const padParts = 8;
       const padBytes = 14;
+      const padClass = 14;
+      const padCoverage = 16;
 
       log(
         "Key".padEnd(padKey) +
         "Upload ID".padEnd(padId) +
         "Initiated".padEnd(padInit) +
         "Parts".padEnd(padParts) +
-        "Stranded Bytes".padEnd(padBytes)
+        "Stranded Bytes".padEnd(padBytes) +
+        "Storage Class".padEnd(padClass) +
+        "Coverage".padEnd(padCoverage)
       );
-      log("-".repeat(padKey + padId + padInit + padParts + padBytes));
+      log("-".repeat(padKey + padId + padInit + padParts + padBytes + padClass + padCoverage));
 
-      for (const u of scanResult.uploads) {
+      for (const u of enrichedUploads) {
         const shortKey = u.key.length > padKey - 3 ? u.key.slice(0, padKey - 3) + "..." : u.key;
         const shortId = u.uploadId.length > padId - 3 ? u.uploadId.slice(0, padId - 3) + "..." : u.uploadId;
         const initStr = u.initiated.replace("T", " ").replace(/\.\d+Z$/, "");
+        // Flag non-standard storage classes (Glacier Staging Trap)
+        const storageClassDisplay =
+          u.storageClass !== "STANDARD" ? `⚠ ${u.storageClass}` : u.storageClass;
 
         log(
           shortKey.padEnd(padKey) +
           shortId.padEnd(padId) +
           initStr.padEnd(padInit) +
           String(u.partsCount).padEnd(padParts) +
-          formatBytes(u.bytes).padEnd(padBytes)
+          formatBytes(u.bytes).padEnd(padBytes) +
+          storageClassDisplay.padEnd(padClass) +
+          u.lifecycleStatus.padEnd(padCoverage)
         );
       }
 
@@ -184,6 +227,11 @@ export async function main(
       log(`  Zombie Uploads:           ${scanResult.totalZombieUploads}`);
       log(`  Total Stranded Storage:   ${formatBytes(scanResult.totalStrandedBytes)} (${scanResult.totalStrandedBytes.toLocaleString()} bytes)`);
       log(`  Estimated Monthly Waste:  ${formatMonthlyCost(scanResult.estimatedMonthlyWasteUSD)} (AWS S3 Standard baseline)`);
+
+      if (scanResult.totalZombieUploads > 10_000) {
+        log(`\n⚠️  High Volume Warning: Executing apply on >10k uploads will generate substantial CloudTrail Data Events.`);
+      }
+
       log("\nNext steps:");
       log(`  Generate an execution plan to safely clean up:`);
       log(`  $ s3-guardian plan ${bucket} --out plan.json\n`);
@@ -201,17 +249,35 @@ export async function main(
 
       log(`📝 Scanning '${bucket}' to generate deletion plan (older than ${olderThanDays} days)...`);
       const client = createS3Client(clientConfig);
-      const scanResult = await scanMultipartUploads(client, bucket, {
-        olderThanDays,
-        endpoint,
-        prefix,
+
+      // Run scan and lifecycle audit concurrently (both are read-only)
+      const [scanResult, lifecycleAudit] = await Promise.all([
+        scanMultipartUploads(client, bucket, {
+          olderThanDays,
+          endpoint,
+          prefix,
+        }),
+        auditBucketLifecycle(client, bucket, endpoint),
+      ]);
+
+      // Enrich uploads with lifecycle coverage status
+      const now = new Date();
+      const enrichedUploads = scanResult.uploads.map((u) => {
+        const coverage = evaluateUploadCoverage(
+          u.key,
+          new Date(u.initiated),
+          lifecycleAudit.mpuRules ?? [],
+          now
+        );
+        return { ...u, lifecycleStatus: coverage.status };
       });
 
       const plan: Plan = createPlan({
         bucket,
         endpoint,
         olderThanDays,
-        uploads: scanResult.uploads,
+        uploads: enrichedUploads,
+        lifecycleAudit,
       });
 
       await writePlanFile(outFile, plan);
@@ -222,6 +288,20 @@ export async function main(
       log(`  Total Stranded Storage:   ${formatBytes(plan.totalStrandedBytes)}`);
       log(`  Estimated Monthly Waste:  ${formatMonthlyCost(plan.estimatedMonthlyWasteUSD)}`);
       log(`  Plan File:                ${outFile}`);
+
+      // Print lifecycle audit summary
+      if (lifecycleAudit.providerNotes) {
+        log(`\nℹ️  Lifecycle Note: ${lifecycleAudit.providerNotes}`);
+      } else if (!lifecycleAudit.hasCoveringRule) {
+        log(`\n[!] Lifecycle Audit: Bucket has NO lifecycle rule covering multipart uploads.`);
+      }
+      for (const ghost of lifecycleAudit.ghostRulesDetected) {
+        log(`[!] Ghost Rule: ${ghost}`);
+      }
+
+      if (plan.highVolumeWarning) {
+        log(`\n⚠️  ${plan.highVolumeWarning}`);
+      }
 
       if (plan.totalZombieUploads > 0) {
         log("\nNext steps:");
@@ -265,6 +345,10 @@ export async function main(
       if (plan.uploads.length === 0) {
         log("Plan contains 0 uploads to abort. Nothing to do.");
         return 0;
+      }
+
+      if (plan.highVolumeWarning) {
+        log(`\n⚠️  ${plan.highVolumeWarning}`);
       }
 
       log(`Executing abort operations for bucket '${plan.bucket}' (${plan.uploads.length} upload(s))...`);

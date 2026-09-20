@@ -2,7 +2,7 @@
 import { parseArgs } from "node:util";
 import { createS3Client } from "./client.js";
 import { scanMultipartUploads } from "./scanner/multipart.js";
-import { createPlan, writePlanFile, readPlanFile, Plan } from "./planner/plan.js";
+import { createPlan, writePlanFile, readPlanFile, Plan, VersionDeletionEntry } from "./planner/plan.js";
 import { executeAbortPlan } from "./executor/abort.js";
 import { formatBytes, formatMonthlyCost } from "./cost/estimator.js";
 import { auditBucketLifecycle, evaluateUploadCoverage } from "./lifecycle/audit.js";
@@ -12,15 +12,18 @@ import { S3ClientPool } from "./discovery/client-pool.js";
 import { formatOrSaveIac, IacFormat } from "./remediation/iac.js";
 import { applyLifecycleRuleDirectly } from "./remediation/api.js";
 import { dispatchNotification, WebhookType } from "./notifications/dispatcher.js";
+import { scanObjectVersions, VersionScanResult } from "./versioning/scanner.js";
+import { executeVersionDeletion } from "./versioning/executor.js";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 
 const HELP_TEXT = `
-s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads
+s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioning waste
 
 USAGE:
   s3-guardian scan <bucket> [options]
   s3-guardian scan --all-buckets [options]
+  s3-guardian scan-versions <bucket> [options]
   s3-guardian plan <bucket> --out <file> [options]
   s3-guardian plan --all-buckets --out <file> [options]
   s3-guardian apply --plan <file> --confirm [options]
@@ -30,13 +33,15 @@ USAGE:
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
   scan --all-buckets      Read-only fleet scan across all account buckets
+  scan-versions <bucket>  Scan for noncurrent object versions and expired delete markers
   plan <bucket>           Generate an inspectable, deterministic JSON plan file
   plan --all-buckets      Generate a fleet-wide plan (summary JSON)
-  apply                   Execute aborts defined in a plan file (requires --confirm)
+  apply                   Execute aborts and version deletions defined in a plan file (requires --confirm)
   remediate <bucket>      Generate IaC fix (Terraform / CloudFormation) or apply direct rule
 
 OPTIONS:
   --older-than <days>          Age threshold in days (default: 7)
+  --include-versions           Scan and plan for noncurrent versions and expired delete markers
   --out <file>                 Output path for plan file (default: plan.json)
   --plan <file>                Plan file to apply
   --confirm                    Explicit confirmation required to execute apply deletions
@@ -68,13 +73,12 @@ EXIT CODES:
   3   Account discovery / authentication failure
 
 SAFETY GUARANTEES:
-  • 'scan' and 'plan' are 100% read-only.
+  • 'scan', 'scan-versions', and 'plan' are 100% read-only.
   • 'remediate' defaults to generating deterministic IaC code (GitOps-first).
   • Direct API mutation requires explicit '--danger-direct-api-apply' and preserves 100% of existing rules.
   • 'apply' strictly requires both a valid plan file and the '--confirm' flag.
   • Fleet mode: per-bucket failures (403, 404, RequesterPays) are isolated and never abort the full scan.
-  • ListParts fan-out concurrency is capped at 10 to prevent 503 Slow Down rate-limits.
-  • Fleet bucket concurrency is capped at 5.
+  • Bulk deletion uses Quiet mode while unconditionally inspecting response.Errors.
 `;
 
 export interface CliOptions {
@@ -170,7 +174,6 @@ function renderFleetGitHub(
     log(``);
   }
 
-  // Per-bucket detail
   const audited = result.bucketResults.filter((r) => r.status === "AUDITED");
   if (audited.length > 0) {
     log(`### Bucket Details`);
@@ -203,6 +206,32 @@ function renderFleetGitHub(
   }
 }
 
+function renderVersioningTable(
+  versionResult: VersionScanResult,
+  log: (msg: string) => void
+): void {
+  log("\nVersioning Waste Analysis:");
+  const padNV = 22;
+  const padSS = 18;
+  const padMC = 16;
+  const padEDM = 24;
+
+  log(
+    "Noncurrent Versions".padEnd(padNV) +
+    "Stranded Size".padEnd(padSS) +
+    "Monthly Cost".padEnd(padMC) +
+    "Expired Delete Markers".padEnd(padEDM)
+  );
+  log("-".repeat(padNV + padSS + padMC + padEDM));
+
+  log(
+    String(versionResult.noncurrentVersionsCount).padEnd(padNV) +
+    formatBytes(versionResult.noncurrentBytes).padEnd(padSS) +
+    formatMonthlyCost(versionResult.estimatedMonthlyWasteUSD).padEnd(padMC) +
+    String(versionResult.expiredDeleteMarkersCount).padEnd(padEDM)
+  );
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function main(
@@ -219,6 +248,7 @@ export async function main(
       options: {
         bucket: { type: "string" },
         "older-than": { type: "string", default: "7" },
+        "include-versions": { type: "boolean", default: false },
         out: { type: "string" },
         plan: { type: "string" },
         confirm: { type: "boolean", default: false },
@@ -282,6 +312,8 @@ export async function main(
   const prefix = getString(values.prefix);
   const forcePathStyle = values["force-path-style"] === true;
   const allBuckets = values["all-buckets"] === true;
+  const includeVersions =
+    values["include-versions"] === true || command === "scan-versions";
   const excludeBuckets = splitCsv(getString(values["exclude-bucket"]));
   const excludeRegions = splitCsv(getString(values["exclude-region"]));
   const failOnUnprotected = values["fail-on-unprotected"] === true;
@@ -293,7 +325,6 @@ export async function main(
   const notifyAlways = values["notify-always"] === true;
   const checkpoint = getString(values.checkpoint);
 
-  // Parse --max-waste-usd
   let maxWasteUSD: number | undefined;
   const maxWasteStr = getString(values["max-waste-usd"]);
   if (maxWasteStr !== undefined) {
@@ -305,13 +336,13 @@ export async function main(
   }
 
   const policyOptions: PolicyOptions = { maxWasteUSD, failOnUnprotected };
-
   const clientConfig = { region, endpoint, forcePathStyle };
 
   // ════════════════════════════════════════════════════════════════════════════
   switch (command) {
-    // ── SCAN ─────────────────────────────────────────────────────────────────
-    case "scan": {
+    // ── SCAN & SCAN-VERSIONS ─────────────────────────────────────────────────
+    case "scan":
+    case "scan-versions": {
       // ── Fleet mode: --all-buckets ──────────────────────────────────────────
       if (allBuckets) {
         if (!isJson && !isGitHub) {
@@ -345,7 +376,6 @@ export async function main(
 
         const policyResult = evaluatePolicy(fleetResult, policyOptions);
 
-        // Webhook notification dispatch
         if (webhookUrl) {
           await dispatchNotification(
             {
@@ -381,7 +411,6 @@ export async function main(
           return policyResult.exitCode;
         }
 
-        // Terminal table
         log(`\nFleet Scan Summary:`);
         log(`  Buckets Discovered:       ${fleetResult.bucketsDiscovered}`);
         log(`  Buckets Audited:          ${fleetResult.bucketsAudited}`);
@@ -392,7 +421,6 @@ export async function main(
         log(``);
         renderFleetTable(fleetResult, log);
 
-        // Check if any bucket is unprotected or has ghost rules
         const hasUnprotectedFleet = fleetResult.bucketResults.some(
           (b) => b.status === "AUDITED" && (!b.lifecycleAudit?.hasCoveringRule || (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
         );
@@ -422,9 +450,12 @@ export async function main(
 
       const client = createS3Client(clientConfig);
 
-      const [scanResult, lifecycleAudit] = await Promise.all([
+      const [scanResult, lifecycleAudit, versionResult] = await Promise.all([
         scanMultipartUploads(client, bucketArg, { olderThanDays, endpoint, prefix }),
         auditBucketLifecycle(client, bucketArg, endpoint),
+        includeVersions
+          ? scanObjectVersions(client, bucketArg, { olderThanDays, prefix })
+          : Promise.resolve(null),
       ]);
 
       const now = new Date();
@@ -438,7 +469,10 @@ export async function main(
         return { ...u, lifecycleStatus: coverage.status };
       });
 
-      // Webhook notification dispatch
+      const totalMonthlyWaste =
+        scanResult.estimatedMonthlyWasteUSD +
+        (versionResult ? versionResult.estimatedMonthlyWasteUSD : 0);
+
       if (webhookUrl) {
         await dispatchNotification(
           {
@@ -446,7 +480,7 @@ export async function main(
             target: bucketArg,
             totalZombieUploads: scanResult.totalZombieUploads,
             totalStrandedBytes: scanResult.totalStrandedBytes,
-            totalEstimatedMonthlyWasteUSD: scanResult.estimatedMonthlyWasteUSD,
+            totalEstimatedMonthlyWasteUSD: totalMonthlyWaste,
             policyViolations: [],
           },
           {
@@ -458,7 +492,18 @@ export async function main(
       }
 
       if (isJson) {
-        log(JSON.stringify({ ...scanResult, uploads: enrichedUploads, lifecycleAudit }, null, 2));
+        log(
+          JSON.stringify(
+            {
+              ...scanResult,
+              uploads: enrichedUploads,
+              lifecycleAudit,
+              versioning: versionResult ?? undefined,
+            },
+            null,
+            2
+          )
+        );
         return EXIT_CODES.SUCCESS;
       }
 
@@ -481,60 +526,64 @@ export async function main(
 
       if (enrichedUploads.length === 0) {
         log(`\n✅ Clean! No multipart uploads older than ${olderThanDays} days found in '${bucketArg}'.`);
-        return EXIT_CODES.SUCCESS;
-      }
+      } else {
+        log(`\nFound ${scanResult.totalZombieUploads} zombie multipart upload(s):\n`);
 
-      log(`\nFound ${scanResult.totalZombieUploads} zombie multipart upload(s):\n`);
-
-      const padKey = 36;
-      const padId = 22;
-      const padInit = 22;
-      const padParts = 8;
-      const padBytes = 14;
-      const padClass = 14;
-      const padCoverage = 16;
-
-      log(
-        "Key".padEnd(padKey) +
-        "Upload ID".padEnd(padId) +
-        "Initiated".padEnd(padInit) +
-        "Parts".padEnd(padParts) +
-        "Stranded Bytes".padEnd(padBytes) +
-        "Storage Class".padEnd(padClass) +
-        "Coverage".padEnd(padCoverage)
-      );
-      log("-".repeat(padKey + padId + padInit + padParts + padBytes + padClass + padCoverage));
-
-      for (const u of enrichedUploads) {
-        const shortKey = u.key.length > padKey - 3 ? u.key.slice(0, padKey - 3) + "..." : u.key;
-        const shortId = u.uploadId.length > padId - 3 ? u.uploadId.slice(0, padId - 3) + "..." : u.uploadId;
-        const initStr = u.initiated.replace("T", " ").replace(/\.\d+Z$/, "");
-        const storageClassDisplay =
-          u.storageClass !== "STANDARD" ? `⚠ ${u.storageClass}` : u.storageClass;
+        const padKey = 36;
+        const padId = 22;
+        const padInit = 22;
+        const padParts = 8;
+        const padBytes = 14;
+        const padClass = 14;
+        const padCoverage = 16;
 
         log(
-          shortKey.padEnd(padKey) +
-          shortId.padEnd(padId) +
-          initStr.padEnd(padInit) +
-          String(u.partsCount).padEnd(padParts) +
-          formatBytes(u.bytes).padEnd(padBytes) +
-          storageClassDisplay.padEnd(padClass) +
-          u.lifecycleStatus.padEnd(padCoverage)
+          "Key".padEnd(padKey) +
+          "Upload ID".padEnd(padId) +
+          "Initiated".padEnd(padInit) +
+          "Parts".padEnd(padParts) +
+          "Stranded Bytes".padEnd(padBytes) +
+          "Storage Class".padEnd(padClass) +
+          "Coverage".padEnd(padCoverage)
         );
+        log("-".repeat(padKey + padId + padInit + padParts + padBytes + padClass + padCoverage));
+
+        for (const u of enrichedUploads) {
+          const shortKey = u.key.length > padKey - 3 ? u.key.slice(0, padKey - 3) + "..." : u.key;
+          const shortId = u.uploadId.length > padId - 3 ? u.uploadId.slice(0, padId - 3) + "..." : u.uploadId;
+          const initStr = u.initiated.replace("T", " ").replace(/\.\d+Z$/, "");
+          const storageClassDisplay =
+            u.storageClass !== "STANDARD" ? `⚠ ${u.storageClass}` : u.storageClass;
+
+          log(
+            shortKey.padEnd(padKey) +
+            shortId.padEnd(padId) +
+            initStr.padEnd(padInit) +
+            String(u.partsCount).padEnd(padParts) +
+            formatBytes(u.bytes).padEnd(padBytes) +
+            storageClassDisplay.padEnd(padClass) +
+            u.lifecycleStatus.padEnd(padCoverage)
+          );
+        }
+
+        log("\nSummary:");
+        log(`  Zombie Uploads:           ${scanResult.totalZombieUploads}`);
+        log(`  Total Stranded Storage:   ${formatBytes(scanResult.totalStrandedBytes)} (${scanResult.totalStrandedBytes.toLocaleString()} bytes)`);
+        log(`  Estimated Monthly Waste:  ${formatMonthlyCost(scanResult.estimatedMonthlyWasteUSD)} (AWS S3 Standard baseline)`);
+
+        if (scanResult.totalZombieUploads > 10_000) {
+          log(`\n⚠️  High Volume Warning: Executing apply on >10k uploads will generate substantial CloudTrail Data Events.`);
+        }
       }
 
-      log("\nSummary:");
-      log(`  Zombie Uploads:           ${scanResult.totalZombieUploads}`);
-      log(`  Total Stranded Storage:   ${formatBytes(scanResult.totalStrandedBytes)} (${scanResult.totalStrandedBytes.toLocaleString()} bytes)`);
-      log(`  Estimated Monthly Waste:  ${formatMonthlyCost(scanResult.estimatedMonthlyWasteUSD)} (AWS S3 Standard baseline)`);
-
-      if (scanResult.totalZombieUploads > 10_000) {
-        log(`\n⚠️  High Volume Warning: Executing apply on >10k uploads will generate substantial CloudTrail Data Events.`);
+      // Display versioning table if requested
+      if (versionResult) {
+        renderVersioningTable(versionResult, log);
       }
 
       log("\nNext steps:");
       log(`  Generate an execution plan to safely clean up:`);
-      log(`  $ s3-guardian plan ${bucketArg} --out plan.json\n`);
+      log(`  $ s3-guardian plan ${bucketArg}${includeVersions ? " --include-versions" : ""} --out plan.json\n`);
 
       return EXIT_CODES.SUCCESS;
     }
@@ -572,7 +621,6 @@ export async function main(
 
         const policyResult = evaluatePolicy(fleetResult, policyOptions);
 
-        // Write fleet summary plan to disk
         const { writeFile, mkdir } = await import("node:fs/promises");
         const { dirname, resolve: pathResolve } = await import("node:path");
         const resolvedOut = pathResolve(outFile);
@@ -612,9 +660,12 @@ export async function main(
       log(`📝 Scanning '${bucketArg}' to generate deletion plan (older than ${olderThanDays} days)...`);
       const client = createS3Client(clientConfig);
 
-      const [scanResult, lifecycleAudit] = await Promise.all([
+      const [scanResult, lifecycleAudit, versionResult] = await Promise.all([
         scanMultipartUploads(client, bucketArg, { olderThanDays, endpoint, prefix }),
         auditBucketLifecycle(client, bucketArg, endpoint),
+        includeVersions
+          ? scanObjectVersions(client, bucketArg, { olderThanDays, prefix })
+          : Promise.resolve(null),
       ]);
 
       const now = new Date();
@@ -628,21 +679,50 @@ export async function main(
         return { ...u, lifecycleStatus: coverage.status };
       });
 
+      let versionDeletions: VersionDeletionEntry[] | undefined;
+      if (versionResult) {
+        versionDeletions = [
+          ...versionResult.noncurrentVersions.map((v) => ({
+            key: v.key,
+            versionId: v.versionId,
+            type: "NONCURRENT_VERSION" as const,
+            size: v.size,
+            lastModified: v.lastModified,
+          })),
+          ...versionResult.expiredDeleteMarkers.map((dm) => ({
+            key: dm.key,
+            versionId: dm.versionId,
+            type: "EXPIRED_DELETE_MARKER" as const,
+            size: 0,
+            lastModified: dm.lastModified,
+          })),
+        ];
+      }
+
       const plan: Plan = createPlan({
         bucket: bucketArg,
         endpoint,
         olderThanDays,
         uploads: enrichedUploads,
+        versionDeletions,
         lifecycleAudit,
       });
 
       await writePlanFile(outFile, plan);
 
       log(`\nPlan generated successfully!`);
+      log(`  Schema Version:           ${plan.schemaVersion}`);
       log(`  Bucket:                   ${bucketArg}`);
       log(`  Zombie Uploads:           ${plan.totalZombieUploads}`);
       log(`  Total Stranded Storage:   ${formatBytes(plan.totalStrandedBytes)}`);
       log(`  Estimated Monthly Waste:  ${formatMonthlyCost(plan.estimatedMonthlyWasteUSD)}`);
+
+      if (plan.versionDeletions && plan.versionDeletions.length > 0) {
+        log(`  Noncurrent Versions:      ${plan.totalNoncurrentVersions ?? 0}`);
+        log(`  Expired Delete Markers:   ${plan.totalExpiredDeleteMarkers ?? 0}`);
+        log(`  Versioning Monthly Waste: ${formatMonthlyCost(plan.versioningMonthlyWasteUSD ?? 0)}`);
+      }
+
       log(`  Plan File:                ${outFile}`);
 
       if (lifecycleAudit.providerNotes) {
@@ -662,13 +742,16 @@ export async function main(
         log(`\n⚠️  ${plan.highVolumeWarning}`);
       }
 
-      if (plan.totalZombieUploads > 0) {
+      const totalItemsToClean =
+        plan.totalZombieUploads + (plan.versionDeletions?.length ?? 0);
+
+      if (totalItemsToClean > 0) {
         log("\nNext steps:");
-        log(`  Inspect '${outFile}' to verify targeted uploads.`);
-        log(`  To safely abort these uploads, run:`);
+        log(`  Inspect '${outFile}' to verify targeted deletions.`);
+        log(`  To safely execute these deletions, run:`);
         log(`  $ s3-guardian apply --plan ${outFile} --confirm\n`);
       } else {
-        log(`\nBucket is clean. No uploads scheduled for deletion.`);
+        log(`\nBucket is clean. No items scheduled for deletion.`);
       }
 
       return EXIT_CODES.SUCCESS;
@@ -747,7 +830,6 @@ export async function main(
             await pool.destroy();
           }
         } else {
-          // IaC generation for all buckets
           log(`📝 Fleet Remediation: generating ${iacFormat.toUpperCase()} code for all account buckets...`);
           const discoveryClient = createS3Client(clientConfig);
           let allBucketsList: { Name?: string }[];
@@ -779,6 +861,7 @@ export async function main(
           const output = await formatOrSaveIac(bucketNames, {
             format: iacFormat,
             daysAfterInitiation: days,
+            includeVersioning: includeVersions,
             outIac,
           });
 
@@ -813,10 +896,10 @@ export async function main(
         return EXIT_CODES.SUCCESS;
       }
 
-      // GitOps / IaC Mode (Default)
       const output = await formatOrSaveIac(bucketArg, {
         format: iacFormat,
         daysAfterInitiation: days,
+        includeVersioning: includeVersions,
         outIac,
       });
 
@@ -838,7 +921,7 @@ export async function main(
 
       if (values.confirm !== true) {
         error(
-          "\n❌ Safety check failed: The '--confirm' flag is strictly required to execute aborts.\n" +
+          "\n❌ Safety check failed: The '--confirm' flag is strictly required to execute aborts or version deletions.\n" +
           "No changes were made to your bucket.\n\n" +
           `To proceed, review '${planFile}' and run:\n` +
           `  $ s3-guardian apply --plan ${planFile} --confirm\n`
@@ -856,8 +939,11 @@ export async function main(
         return EXIT_CODES.ARG_ERROR;
       }
 
-      if (plan.uploads.length === 0) {
-        log("Plan contains 0 uploads to abort. Nothing to do.");
+      const hasUploads = plan.uploads && plan.uploads.length > 0;
+      const hasVersions = plan.versionDeletions && plan.versionDeletions.length > 0;
+
+      if (!hasUploads && !hasVersions) {
+        log("Plan contains 0 items to delete. Nothing to do.");
         return EXIT_CODES.SUCCESS;
       }
 
@@ -865,42 +951,84 @@ export async function main(
         log(`\n⚠️  ${plan.highVolumeWarning}`);
       }
 
-      log(`Executing abort operations for bucket '${plan.bucket}' (${plan.uploads.length} upload(s))...`);
-
       const effectiveClientConfig = {
         region,
         endpoint: endpoint ?? plan.endpoint ?? undefined,
         forcePathStyle,
       };
-
       const client = createS3Client(effectiveClientConfig);
-      const result = await executeAbortPlan(client, plan, {
-        confirm: true,
-        onProgress: (completed, total, item, status) => {
-          if (status === "SKIPPED_ALREADY_ABORTED") {
-            log(`  [${completed}/${total}] Skipped '${item.key}' (UploadId: ${item.uploadId}) — already aborted or completed`);
-          } else if (status === "FAILED") {
-            log(`  [${completed}/${total}] Failed '${item.key}' (UploadId: ${item.uploadId})`);
-          } else {
-            log(`  [${completed}/${total}] Aborted '${item.key}' (UploadId: ${item.uploadId})`);
-          }
-        },
-      });
 
-      log("\nApply execution summary:");
-      log(`  Total Targeted:       ${result.total}`);
-      log(`  Successfully aborted: ${result.aborted}`);
-      if (result.skipped > 0) {
-        log(`  Skipped (already aborted): ${result.skipped}`);
-      }
-      log(`  Failed:               ${result.failed}`);
-      log(`  Storage Freed:        ${formatBytes(result.bytesFreed)}`);
+      let hadErrors = false;
 
-      if (result.errors.length > 0) {
-        log("\nErrors encountered:");
-        for (const e of result.errors) {
-          log(`  - Key: ${e.key}, UploadId: ${e.uploadId}: ${e.error}`);
+      // 1. Execute multipart upload aborts
+      if (hasUploads) {
+        log(`Executing abort operations for bucket '${plan.bucket}' (${plan.uploads.length} upload(s))...`);
+        const abortResult = await executeAbortPlan(client, plan, {
+          confirm: true,
+          onProgress: (completed, total, item, status) => {
+            if (status === "SKIPPED_ALREADY_ABORTED") {
+              log(`  [${completed}/${total}] Skipped '${item.key}' (UploadId: ${item.uploadId}) — already aborted or completed`);
+            } else if (status === "FAILED") {
+              log(`  [${completed}/${total}] Failed '${item.key}' (UploadId: ${item.uploadId})`);
+            } else {
+              log(`  [${completed}/${total}] Aborted '${item.key}' (UploadId: ${item.uploadId})`);
+            }
+          },
+        });
+
+        log("\nMultipart Upload cleanup summary:");
+        log(`  Total Targeted:       ${abortResult.total}`);
+        log(`  Successfully aborted: ${abortResult.aborted}`);
+        if (abortResult.skipped > 0) {
+          log(`  Skipped (already aborted): ${abortResult.skipped}`);
         }
+        log(`  Failed:               ${abortResult.failed}`);
+        log(`  Storage Freed:        ${formatBytes(abortResult.bytesFreed)}`);
+
+        if (abortResult.errors.length > 0) {
+          hadErrors = true;
+          log("\nErrors encountered during abort:");
+          for (const e of abortResult.errors) {
+            log(`  - Key: ${e.key}, UploadId: ${e.uploadId}: ${e.error}`);
+          }
+        }
+      }
+
+      // 2. Execute version deletions
+      if (hasVersions) {
+        log(`\nExecuting version deletions for bucket '${plan.bucket}' (${plan.versionDeletions!.length} item(s))...`);
+        const entries = plan.versionDeletions!.map((v) => ({
+          Key: v.key,
+          VersionId: v.versionId,
+        }));
+
+        const versionResult = await executeVersionDeletion(
+          client,
+          plan.bucket,
+          entries,
+          {
+            confirm: true,
+            onProgress: (deleted, total) => {
+              log(`  [${deleted}/${total}] Deleted object versions...`);
+            },
+          }
+        );
+
+        log("\nVersion Deletion summary:");
+        log(`  Total Targeted:       ${versionResult.total}`);
+        log(`  Successfully deleted: ${versionResult.deleted}`);
+        log(`  Failed:               ${versionResult.failed}`);
+
+        if (versionResult.errors.length > 0) {
+          hadErrors = true;
+          log("\nErrors encountered during version deletion:");
+          for (const e of versionResult.errors) {
+            log(`  - Key: ${e.Key}, VersionId: ${e.VersionId}: ${e.Message ?? e.Code}`);
+          }
+        }
+      }
+
+      if (hadErrors) {
         return EXIT_CODES.POLICY_VIOLATION;
       }
 

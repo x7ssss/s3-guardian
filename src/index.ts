@@ -14,6 +14,7 @@ export {
   Plan,
   ZombieUploadItem,
   CreatePlanOptions,
+  VersionDeletionEntry,
 } from "./planner/plan.js";
 export {
   scanMultipartUploads,
@@ -74,6 +75,7 @@ export {
   formatOrSaveIac,
   IacFormat,
   GenerateIacOptions,
+  IacSnippetOptions,
 } from "./remediation/iac.js";
 export {
   applyLifecycleRuleDirectly,
@@ -101,6 +103,22 @@ export {
   CheckpointState,
   ParsedS3Uri,
 } from "./checkpoint/s3-checkpoint.js";
+export {
+  scanObjectVersionsStream,
+  scanObjectVersions,
+  VersionPage,
+  VersionScanOptions,
+  VersionScanResult,
+  NoncurrentVersionItem,
+  ExpiredDeleteMarkerItem,
+} from "./versioning/scanner.js";
+export {
+  executeVersionDeletion,
+  TargetVersionIdentifier,
+  VersionExecutorOptions,
+  VersionExecutionResult,
+  VersionDeletionFailure,
+} from "./versioning/executor.js";
 export { handler, LambdaEvent, LambdaResult } from "./lambda.js";
 export { createConcurrencyLimiter, LimitFunction } from "./utils/concurrency.js";
 export { withRetry, isSlowDownError, RetryOptions } from "./utils/retry.js";

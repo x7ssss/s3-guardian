@@ -44,6 +44,26 @@ describe("IaC Remediation Generators", () => {
 
       expect(snippet).toContain('resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_my_complex_bucket_name_2026"');
     });
+
+    it("emits versioning rules and isolated expired_object_delete_marker rule when includeVersioning: true", () => {
+      const snippet = generateTerraformSnippet("versioned-bucket", {
+        includeVersioning: true,
+        noncurrentDays: 30,
+      });
+
+      expect(snippet).toContain("s3-guardian-abort-mpu");
+      expect(snippet).toContain("s3-guardian-expire-noncurrent-versions");
+      expect(snippet).toContain("noncurrent_days = 30");
+
+      // Invariant 4: MalformedXML Prevention - clean isolated rule
+      expect(snippet).toContain("s3-guardian-cleanup-eodm");
+      expect(snippet).toContain("expired_object_delete_marker = true");
+      // Must not mix days with expired_object_delete_marker in the same rule
+      const eodmBlock = snippet.split("s3-guardian-cleanup-eodm")[1];
+      expect(eodmBlock).toContain("expired_object_delete_marker = true");
+      expect(eodmBlock).not.toContain("days = ");
+      expect(eodmBlock).not.toContain("days_after_initiation");
+    });
   });
 
   describe("generateCloudFormationSnippet()", () => {
@@ -64,6 +84,18 @@ describe("IaC Remediation Generators", () => {
       const snippet = generateCloudFormationSnippet("my-cfn-bucket", 3);
 
       expect(snippet).toContain("DaysAfterInitiation: 3");
+    });
+
+    it("emits versioning and expired delete marker rules when includeVersioning: true", () => {
+      const snippet = generateCloudFormationSnippet("cfn-ver-bucket", {
+        includeVersioning: true,
+        noncurrentDays: 45,
+      });
+
+      expect(snippet).toContain("- Id: s3-guardian-expire-noncurrent-versions");
+      expect(snippet).toContain("NoncurrentDays: 45");
+      expect(snippet).toContain("- Id: s3-guardian-cleanup-eodm");
+      expect(snippet).toContain("ExpiredObjectDeleteMarker: true");
     });
   });
 

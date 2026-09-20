@@ -3,28 +3,52 @@ import * as path from "node:path";
 
 export type IacFormat = "terraform" | "cloudformation";
 
-export interface GenerateIacOptions {
-  format?: IacFormat;
+export interface IacSnippetOptions {
   daysAfterInitiation?: number;
+  includeVersioning?: boolean;
+  noncurrentDays?: number;
+}
+
+export interface GenerateIacOptions extends IacSnippetOptions {
+  format?: IacFormat;
   outIac?: string;
+}
+
+function resolveSnippetOptions(
+  optionsOrDays: number | IacSnippetOptions = 7
+): Required<IacSnippetOptions> {
+  if (typeof optionsOrDays === "number") {
+    return {
+      daysAfterInitiation: optionsOrDays,
+      includeVersioning: false,
+      noncurrentDays: 30,
+    };
+  }
+  return {
+    daysAfterInitiation: optionsOrDays.daysAfterInitiation ?? 7,
+    includeVersioning: optionsOrDays.includeVersioning ?? false,
+    noncurrentDays: optionsOrDays.noncurrentDays ?? 30,
+  };
 }
 
 /**
  * Generates a modern Terraform (AWS Provider v4+) resource block
- * for `aws_s3_bucket_lifecycle_configuration` targeting MPU cleanup.
+ * for `aws_s3_bucket_lifecycle_configuration`.
  *
- * Invariant: GitOps-first. Emits deterministic, readable HCL snippet.
+ * Invariants:
+ *  - GitOps-first: emits deterministic, readable HCL snippet.
+ *  - MalformedXML Prevention: ExpiredObjectDeleteMarker is isolated in a dedicated rule
+ *    with an empty filter and NO Days/Date/Tag constraints.
  */
 export function generateTerraformSnippet(
   bucket: string,
-  daysAfterInitiation: number = 7
+  optionsOrDays: number | IacSnippetOptions = 7
 ): string {
+  const { daysAfterInitiation, includeVersioning, noncurrentDays } =
+    resolveSnippetOptions(optionsOrDays);
   const resourceName = `lifecycle_${bucket.replace(/[^a-zA-Z0-9_]/g, "_")}`;
-  return `# Terraform (AWS Provider v4+) Lifecycle Configuration for '${bucket}'
-resource "aws_s3_bucket_lifecycle_configuration" "${resourceName}" {
-  bucket = "${bucket}"
 
-  rule {
+  let rulesHcl = `  rule {
     id     = "s3-guardian-abort-mpu"
     status = "Enabled"
 
@@ -34,29 +58,74 @@ resource "aws_s3_bucket_lifecycle_configuration" "${resourceName}" {
     abort_incomplete_multipart_upload {
       days_after_initiation = ${daysAfterInitiation}
     }
+  }`;
+
+  if (includeVersioning) {
+    rulesHcl += `\n\n  rule {
+    id     = "s3-guardian-expire-noncurrent-versions"
+    status = "Enabled"
+
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = ${noncurrentDays}
+    }
+  }\n\n  # Invariant 4 (MalformedXML Prevention): Dedicated rule for expired delete markers
+  # with clean empty filter and NO Days/Date/Tag constraints.
+  rule {
+    id     = "s3-guardian-cleanup-eodm"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      expired_object_delete_marker = true
+    }
+  }`;
   }
+
+  return `# Terraform (AWS Provider v4+) Lifecycle Configuration for '${bucket}'
+resource "aws_s3_bucket_lifecycle_configuration" "${resourceName}" {
+  bucket = "${bucket}"
+
+${rulesHcl}
 }
 `;
 }
 
 /**
  * Generates a CloudFormation YAML snippet for `AWS::S3::Bucket`
- * containing `LifecycleConfiguration.Rules` with an MPU abort rule.
+ * containing `LifecycleConfiguration.Rules`.
  */
 export function generateCloudFormationSnippet(
   bucket: string,
-  daysAfterInitiation: number = 7
+  optionsOrDays: number | IacSnippetOptions = 7
 ): string {
+  const { daysAfterInitiation, includeVersioning, noncurrentDays } =
+    resolveSnippetOptions(optionsOrDays);
+
+  let rulesYaml = `        - Id: s3-guardian-abort-mpu
+          Status: Enabled
+          AbortIncompleteMultipartUpload:
+            DaysAfterInitiation: ${daysAfterInitiation}`;
+
+  if (includeVersioning) {
+    rulesYaml += `\n        - Id: s3-guardian-expire-noncurrent-versions
+          Status: Enabled
+          NoncurrentVersionExpiration:
+            NoncurrentDays: ${noncurrentDays}
+        - Id: s3-guardian-cleanup-eodm
+          Status: Enabled
+          ExpiredObjectDeleteMarker: true`;
+  }
+
   return `# CloudFormation LifecycleConfiguration snippet for '${bucket}'
 Type: AWS::S3::Bucket
 Properties:
   BucketName: "${bucket}"
   LifecycleConfiguration:
     Rules:
-      - Id: s3-guardian-abort-mpu
-        Status: Enabled
-        AbortIncompleteMultipartUpload:
-          DaysAfterInitiation: ${daysAfterInitiation}
+${rulesYaml}
 `;
 }
 
@@ -72,17 +141,16 @@ export async function formatOrSaveIac(
   options: GenerateIacOptions = {}
 ): Promise<string> {
   const format = options.format ?? "terraform";
-  const days = options.daysAfterInitiation ?? 7;
   const bucketList = Array.isArray(buckets) ? buckets : [buckets];
 
   let output = "";
   if (format === "cloudformation") {
     output = bucketList
-      .map((b) => generateCloudFormationSnippet(b, days))
+      .map((b) => generateCloudFormationSnippet(b, options))
       .join("\n---\n\n");
   } else {
     output = bucketList
-      .map((b) => generateTerraformSnippet(b, days))
+      .map((b) => generateTerraformSnippet(b, options))
       .join("\n");
   }
 

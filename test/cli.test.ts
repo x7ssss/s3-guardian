@@ -8,6 +8,8 @@ import {
   AbortMultipartUploadCommand,
   GetBucketLifecycleConfigurationCommand,
   PutBucketLifecycleConfigurationCommand,
+  ListObjectVersionsCommand,
+  DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -57,7 +59,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.5.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.6.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -589,5 +591,124 @@ describe("CLI entrypoint and subcommand flow", () => {
       captureIO
     );
     expect(code).toBe(0);
+  });
+
+  it("scan --include-versions displays versioning waste table", async () => {
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      IsTruncated: false,
+      Uploads: [],
+    });
+    stubNoLifecycle();
+
+    s3Mock.on(ListObjectVersionsCommand).resolves({
+      IsTruncated: false,
+      Versions: [
+        { Key: "old-doc.pdf", VersionId: "v1", IsLatest: false, Size: 1048576 },
+      ],
+      DeleteMarkers: [
+        { Key: "deleted-doc.pdf", VersionId: "dm1", IsLatest: true },
+      ],
+    });
+
+    const code = await main(
+      ["scan", "versioned-bucket", "--include-versions"],
+      captureIO
+    );
+
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("Noncurrent Versions");
+    expect(output).toContain("Stranded Size");
+    expect(output).toContain("Monthly Cost");
+    expect(output).toContain("Expired Delete Markers");
+  });
+
+  it("plan --include-versions generates plan schema 1.2 with versionDeletions", async () => {
+    const tempFile = path.join(os.tmpdir(), `test-plan-ver-${Date.now()}.json`);
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      IsTruncated: false,
+      Uploads: [],
+    });
+    stubNoLifecycle();
+
+    s3Mock.on(ListObjectVersionsCommand).resolves({
+      IsTruncated: false,
+      Versions: [
+        { Key: "noncurrent.bin", VersionId: "v-old", IsLatest: false, Size: 2048 },
+      ],
+      DeleteMarkers: [],
+    });
+
+    try {
+      const code = await main(
+        ["plan", "versioned-bucket", "--include-versions", "--out", tempFile],
+        captureIO
+      );
+      expect(code).toBe(0);
+
+      const raw = await fs.readFile(tempFile, "utf8");
+      const plan = JSON.parse(raw);
+      expect(plan.schemaVersion).toBe("1.2");
+      expect(plan.versionDeletions).toHaveLength(1);
+      expect(plan.versionDeletions[0].key).toBe("noncurrent.bin");
+      expect(plan.versionDeletions[0].versionId).toBe("v-old");
+      expect(plan.totalNoncurrentVersions).toBe(1);
+    } finally {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+  });
+
+  it("apply executes version deletions when plan has versionDeletions", async () => {
+    const tempFile = path.join(os.tmpdir(), `test-plan-apply-ver-${Date.now()}.json`);
+    const plan: Plan = {
+      schemaVersion: "1.2",
+      generatedAt: new Date().toISOString(),
+      bucket: "apply-ver-bucket",
+      endpoint: null,
+      olderThanDays: 7,
+      totalZombieUploads: 0,
+      totalStrandedBytes: 0,
+      estimatedMonthlyWasteUSD: 0,
+      lifecycleAudit: {
+        bucketHasLifecyclePolicy: true,
+        hasCoveringRule: true,
+        ghostRulesDetected: [],
+      },
+      uploads: [],
+      versionDeletions: [
+        {
+          key: "file-to-delete.txt",
+          versionId: "v-del",
+          type: "NONCURRENT_VERSION",
+          size: 512,
+          lastModified: new Date().toISOString(),
+        },
+      ],
+      totalNoncurrentVersions: 1,
+      totalExpiredDeleteMarkers: 0,
+    };
+
+    await writePlanFile(tempFile, plan);
+
+    s3Mock.on(DeleteObjectsCommand).resolvesOnce({
+      Deleted: [],
+      Errors: [],
+    });
+
+    try {
+      const code = await main(
+        ["apply", "--plan", tempFile, "--confirm"],
+        captureIO
+      );
+      expect(code).toBe(0);
+      expect(stdoutLogs.join(" ")).toContain("Successfully deleted: 1");
+
+      const delCalls = s3Mock.commandCalls(DeleteObjectsCommand);
+      expect(delCalls.length).toBe(1);
+      expect(delCalls[0].args[0].input.Bucket).toBe("apply-ver-bucket");
+      expect(delCalls[0].args[0].input.Delete?.Objects?.[0].Key).toBe("file-to-delete.txt");
+    } finally {
+      await fs.unlink(tempFile).catch(() => {});
+    }
   });
 });

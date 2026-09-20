@@ -176,8 +176,8 @@ describe("Versioning Scanner", () => {
 
       // Setup:
       // 1. "file1.txt" has current (100b) and noncurrent (200b)
-      // 2. "file2.txt" was deleted, has DeleteMarker (IsLatest: true) and an old noncurrent version (300b) -> DM is NOT expired
-      // 3. "file3.txt" has ONLY a DeleteMarker (IsLatest: true) and NO data versions -> EODM!
+      // 2. "file2.txt" has an old noncurrent version (300b) and an old noncurrent delete marker (IsLatest: false)
+      // 3. "file3.txt" has a current DeleteMarker (IsLatest: true) -> EODM!
       // 4. "file4.txt" has current (500b) only
       s3Mock.on(ListObjectVersionsCommand).resolvesOnce({
         IsTruncated: false,
@@ -188,7 +188,7 @@ describe("Versioning Scanner", () => {
           { Key: "file4.txt", VersionId: "v4-latest", IsLatest: true, Size: 500 },
         ],
         DeleteMarkers: [
-          { Key: "file2.txt", VersionId: "dm2", IsLatest: true },
+          { Key: "file2.txt", VersionId: "dm2", IsLatest: false },
           { Key: "file3.txt", VersionId: "dm3", IsLatest: true }, // Expired Object Delete Marker!
         ],
       });

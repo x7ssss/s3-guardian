@@ -209,13 +209,8 @@ export async function scanObjectVersions(
     }
   }
 
-  // Expired Object Delete Marker (EODM): dm.IsLatest is true AND key has no data versions
-  const expiredDeleteMarkers: ExpiredDeleteMarkerItem[] = [];
-  for (const dm of candidateDeleteMarkers) {
-    if (!keysWithDataVersions.has(dm.key)) {
-      expiredDeleteMarkers.push(dm);
-    }
-  }
+  // Expired Object Delete Marker (EODM): delete marker where dm.IsLatest is true (object is deleted)
+  const expiredDeleteMarkers: ExpiredDeleteMarkerItem[] = candidateDeleteMarkers;
 
   const estimatedMonthlyWasteUSD = calculateMonthlyCostUSD(noncurrentBytes);
 

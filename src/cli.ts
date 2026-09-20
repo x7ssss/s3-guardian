@@ -1394,7 +1394,9 @@ export async function main(
 
     // ── APPLY ─────────────────────────────────────────────────────────────────
     case "apply": {
-      const planFile = getString(values.plan);
+      const planFile =
+        getString(values.plan) ||
+        (typeof positionals[1] === "string" ? positionals[1] : undefined);
       if (!planFile) {
         error("Error: --plan <file> is required for 'apply'. Usage: s3-guardian apply --plan <file> --confirm");
         return EXIT_CODES.ARG_ERROR;

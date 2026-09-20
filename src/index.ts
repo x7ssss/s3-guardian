@@ -122,3 +122,27 @@ export {
 export { handler, LambdaEvent, LambdaResult } from "./lambda.js";
 export { createConcurrencyLimiter, LimitFunction } from "./utils/concurrency.js";
 export { withRetry, isSlowDownError, RetryOptions } from "./utils/retry.js";
+export {
+  STSSessionPool,
+  STSSessionPoolOptions,
+  AssumeRoleOptions,
+  AssumedRoleCredentials,
+  isStsThrottlingError,
+} from "./auth/sts-pool.js";
+export {
+  discoverOrganizationAccounts,
+  resolveTargetAccounts,
+  parseAccountsFile,
+  OrganizationsDiscoveryError,
+  OrganizationAccount,
+  DiscoverAccountsOptions,
+  ResolveAccountsOptions,
+} from "./discovery/organizations.js";
+export {
+  runMultiAccountSweep,
+  AccountSweepResult,
+  MultiAccountSweepResult,
+  MultiAccountSweepOptions,
+  AccountStatus,
+} from "./multi-account/runner.js";
+

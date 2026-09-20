@@ -4,6 +4,7 @@ export interface S3ClientConfigOptions {
   region?: string;
   endpoint?: string;
   forcePathStyle?: boolean;
+  credentials?: S3ClientConfig["credentials"];
 }
 
 /**
@@ -38,6 +39,10 @@ export function createS3Client(options: S3ClientConfigOptions = {}): S3Client {
 
   if (forcePathStyle !== undefined) {
     config.forcePathStyle = forcePathStyle;
+  }
+
+  if (options.credentials !== undefined) {
+    config.credentials = options.credentials;
   }
 
   return new S3Client(config);

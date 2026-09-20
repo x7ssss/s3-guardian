@@ -14,8 +14,18 @@ import { applyLifecycleRuleDirectly } from "./remediation/api.js";
 import { dispatchNotification, WebhookType } from "./notifications/dispatcher.js";
 import { scanObjectVersions, VersionScanResult } from "./versioning/scanner.js";
 import { executeVersionDeletion } from "./versioning/executor.js";
+import {
+  resolveTargetAccounts,
+  OrganizationsDiscoveryError,
+  OrganizationAccount,
+} from "./discovery/organizations.js";
+import {
+  runMultiAccountSweep,
+  MultiAccountSweepResult,
+  AccountSweepResult,
+} from "./multi-account/runner.js";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioning waste
@@ -23,9 +33,13 @@ s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioni
 USAGE:
   s3-guardian scan <bucket> [options]
   s3-guardian scan --all-buckets [options]
+  s3-guardian scan --org [options]
+  s3-guardian scan --accounts <id,id,...> [options]
   s3-guardian scan-versions <bucket> [options]
+  s3-guardian scan-versions --org [options]
   s3-guardian plan <bucket> --out <file> [options]
   s3-guardian plan --all-buckets --out <file> [options]
+  s3-guardian plan --org --out <file> [options]
   s3-guardian apply --plan <file> --confirm [options]
   s3-guardian remediate <bucket> [options]
   s3-guardian remediate --all-buckets [options]
@@ -33,9 +47,11 @@ USAGE:
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
   scan --all-buckets      Read-only fleet scan across all account buckets
+  scan --org              Multi-account sweep across AWS Organizations accounts
   scan-versions <bucket>  Scan for noncurrent object versions and expired delete markers
   plan <bucket>           Generate an inspectable, deterministic JSON plan file
   plan --all-buckets      Generate a fleet-wide plan (summary JSON)
+  plan --org              Generate a multi-account organization plan (summary JSON)
   apply                   Execute aborts and version deletions defined in a plan file (requires --confirm)
   remediate <bucket>      Generate IaC fix (Terraform / CloudFormation) or apply direct rule
 
@@ -50,6 +66,13 @@ OPTIONS:
   --region <region>            AWS Region (default: us-east-1 or AWS_REGION)
   --prefix <prefix>            Filter uploads by object key prefix
   --all-buckets                Scan / remediate all buckets in the account (fleet mode)
+  --org                        Discover member accounts via AWS Organizations
+  --role-name <name>           IAM role name to assume into member accounts (default: OrganizationAccountAccessRole)
+  --external-id <id>           Optional external ID for STS AssumeRole
+  --accounts <id,id,...>       Comma-separated AWS account IDs to scan
+  --accounts-file <path>       File containing AWS account IDs (one per line or comma-separated)
+  --exclude-account <id>       Comma-separated AWS account IDs to exclude
+  --account-concurrency <n>    Max concurrent account sweeps (default: 5)
   --exclude-bucket <patterns>  Comma-separated bucket name substrings/globs to exclude
   --exclude-region <regions>   Comma-separated AWS regions to exclude
   --max-waste-usd <amount>     Exit code 1 if total monthly waste exceeds this USD amount
@@ -78,6 +101,7 @@ SAFETY GUARANTEES:
   • Direct API mutation requires explicit '--danger-direct-api-apply' and preserves 100% of existing rules.
   • 'apply' strictly requires both a valid plan file and the '--confirm' flag.
   • Fleet mode: per-bucket failures (403, 404, RequesterPays) are isolated and never abort the full scan.
+  • Multi-account mode: member account failures (403, SCP, STS) never abort the multi-account audit.
   • Bulk deletion uses Quiet mode while unconditionally inspecting response.Errors.
 `;
 
@@ -232,6 +256,133 @@ function renderVersioningTable(
   );
 }
 
+function renderMultiAccountTable(
+  result: MultiAccountSweepResult,
+  includeVersions: boolean,
+  log: (msg: string) => void
+): void {
+  const padAccount = 16;
+  const padName = 22;
+  const padStatus = 18;
+  const padBuckets = 10;
+  const padUploads = 10;
+  const padStranded = 14;
+  const padWaste = 12;
+  const padVersions = includeVersions ? 10 : 0;
+  const padVerWaste = includeVersions ? 12 : 0;
+
+  let header =
+    "Account ID".padEnd(padAccount) +
+    "Account Name".padEnd(padName) +
+    "Status".padEnd(padStatus) +
+    "Buckets".padEnd(padBuckets) +
+    "Uploads".padEnd(padUploads) +
+    "Stranded".padEnd(padStranded) +
+    "Waste/mo".padEnd(padWaste);
+
+  if (includeVersions) {
+    header += "Versions".padEnd(padVersions) + "Ver.Waste".padEnd(padVerWaste);
+  }
+
+  const totalWidth =
+    padAccount + padName + padStatus + padBuckets + padUploads + padStranded + padWaste +
+    padVersions + padVerWaste;
+
+  log(header);
+  log("-".repeat(totalWidth));
+
+  for (const r of result.accountResults) {
+    const shortName =
+      r.accountName.length > padName - 2
+        ? r.accountName.slice(0, padName - 3) + "..."
+        : r.accountName;
+
+    let statusDisplay = "✓ SUCCESS";
+    if (r.status === "PARTIAL") statusDisplay = "⚠ PARTIAL";
+    else if (r.status === "SKIPPED_ASSUME_ROLE_FAILED") statusDisplay = "⚠ STS_FAILED";
+    else if (r.status === "SKIPPED_ACCESS_DENIED") statusDisplay = "⚠ ACCESS_DENIED";
+    else if (r.status === "ERROR") statusDisplay = "❌ ERROR";
+
+    const isAudited = r.status === "SUCCESS" || r.status === "PARTIAL";
+    const buckets = isAudited ? `${r.bucketsAudited}/${r.bucketsDiscovered}` : "—";
+    const uploads = isAudited ? String(r.totalZombieUploads) : "—";
+    const stranded = isAudited ? formatBytes(r.totalStrandedBytes) : "—";
+    const waste = isAudited ? formatMonthlyCost(r.totalEstimatedMonthlyWasteUSD) : "—";
+
+    let row =
+      r.accountId.padEnd(padAccount) +
+      shortName.padEnd(padName) +
+      statusDisplay.padEnd(padStatus) +
+      buckets.padEnd(padBuckets) +
+      uploads.padEnd(padUploads) +
+      stranded.padEnd(padStranded) +
+      waste.padEnd(padWaste);
+
+    if (includeVersions) {
+      const versions = isAudited ? String(r.totalNoncurrentVersions ?? 0) : "—";
+      const vWaste = isAudited ? formatMonthlyCost(r.versioningMonthlyWasteUSD ?? 0) : "—";
+      row += versions.padEnd(padVersions) + vWaste.padEnd(padVerWaste);
+    }
+
+    log(row);
+  }
+
+  log("-".repeat(totalWidth));
+  log(`Total Accounts:        ${result.totalAccounts}`);
+  log(`  Accounts Succeeded:  ${result.accountsSucceeded}`);
+  log(`  Accounts Scanned:    ${result.accountsScanned}`);
+  log(`  Accounts Skipped:    ${result.accountsSkipped}`);
+  log(`Total Buckets:         ${result.totalBucketsAudited} audited (${result.totalBucketsDiscovered} discovered, ${result.totalBucketsSkipped} skipped)`);
+  log(`Total Zombie Uploads:  ${result.totalZombieUploads}`);
+  log(`Total Stranded:        ${formatBytes(result.totalStrandedBytes)}`);
+  log(`Total Monthly Waste:   ${formatMonthlyCost(result.totalCombinedMonthlyWasteUSD)}`);
+  if (includeVersions && (result.totalNoncurrentVersions ?? 0) > 0) {
+    log(`Total Noncurrent Ver.: ${result.totalNoncurrentVersions}`);
+    log(`Versioning Waste:      ${formatMonthlyCost(result.totalVersioningWasteUSD ?? 0)}`);
+  }
+}
+
+function renderMultiAccountGitHub(
+  result: MultiAccountSweepResult,
+  violations: string[],
+  log: (msg: string) => void
+): void {
+  log(`## 🛡️ s3-guardian Multi-Account Sweep — v${VERSION}`);
+  log(``);
+  log(`| Metric | Value |`);
+  log(`|--------|-------|`);
+  log(`| Total Accounts | ${result.totalAccounts} |`);
+  log(`| Accounts Succeeded | ${result.accountsSucceeded} |`);
+  log(`| Accounts Scanned | ${result.accountsScanned} |`);
+  log(`| Accounts Skipped | ${result.accountsSkipped} |`);
+  log(`| Buckets Discovered | ${result.totalBucketsDiscovered} |`);
+  log(`| Buckets Audited | ${result.totalBucketsAudited} |`);
+  log(`| Total Zombie Uploads | ${result.totalZombieUploads} |`);
+  log(`| Total Stranded Storage | ${formatBytes(result.totalStrandedBytes)} |`);
+  log(`| Total Monthly Waste | ${formatMonthlyCost(result.totalCombinedMonthlyWasteUSD)} |`);
+  log(``);
+
+  if (violations.length > 0) {
+    log(`### ❌ Policy Violations`);
+    log(``);
+    for (const v of violations) {
+      log(`- ${v}`);
+    }
+    log(``);
+  }
+
+  log(`### Account Details`);
+  log(``);
+  log(`| Account ID | Account Name | Status | Buckets | Uploads | Stranded | Waste/mo |`);
+  log(`|------------|--------------|--------|---------|---------|----------|----------|`);
+  for (const r of result.accountResults) {
+    log(
+      `| ${r.accountId} | ${r.accountName} | ${r.status} | ${r.bucketsAudited}/${r.bucketsDiscovered} | ${r.totalZombieUploads} | ${formatBytes(r.totalStrandedBytes)} | ${formatMonthlyCost(r.totalMonthlyWasteUSD)} |`
+    );
+  }
+  log(``);
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function main(
@@ -257,6 +408,13 @@ export async function main(
         region: { type: "string" },
         prefix: { type: "string" },
         "all-buckets": { type: "boolean", default: false },
+        org: { type: "boolean", default: false },
+        "role-name": { type: "string" },
+        "external-id": { type: "string" },
+        accounts: { type: "string" },
+        "accounts-file": { type: "string" },
+        "exclude-account": { type: "string" },
+        "account-concurrency": { type: "string", default: "5" },
         "exclude-bucket": { type: "string" },
         "exclude-region": { type: "string" },
         "max-waste-usd": { type: "string" },
@@ -312,6 +470,17 @@ export async function main(
   const prefix = getString(values.prefix);
   const forcePathStyle = values["force-path-style"] === true;
   const allBuckets = values["all-buckets"] === true;
+  const isOrg = values.org === true;
+  const accountsStr = getString(values.accounts);
+  const accountsFile = getString(values["accounts-file"]);
+  const excludeAccounts = splitCsv(getString(values["exclude-account"]));
+  const roleName = getString(values["role-name"]) || "OrganizationAccountAccessRole";
+  const externalId = getString(values["external-id"]);
+  const accountConcurrencyStr = getString(values["account-concurrency"]) ?? "5";
+  const accountConcurrency = parseInt(accountConcurrencyStr, 10) || 5;
+
+  const isMultiAccount = isOrg || Boolean(accountsStr) || Boolean(accountsFile);
+
   const includeVersions =
     values["include-versions"] === true || command === "scan-versions";
   const excludeBuckets = splitCsv(getString(values["exclude-bucket"]));
@@ -343,6 +512,119 @@ export async function main(
     // ── SCAN & SCAN-VERSIONS ─────────────────────────────────────────────────
     case "scan":
     case "scan-versions": {
+      // ── Multi-Account mode: --org or --accounts or --accounts-file ──────────
+      if (isMultiAccount) {
+        if (!isJson && !isGitHub) {
+          log(`🌐 Multi-account sweep: resolving target accounts...`);
+        }
+
+        let targetAccounts: OrganizationAccount[];
+        try {
+          targetAccounts = await resolveTargetAccounts({
+            useOrg: isOrg,
+            accounts: splitCsv(accountsStr),
+            accountsFile,
+            excludeAccounts,
+          });
+        } catch (err: unknown) {
+          if (err instanceof OrganizationsDiscoveryError) {
+            error(`\n❌ Discovery failed: ${err.message}`);
+            return EXIT_CODES.DISCOVERY_AUTH_ERROR;
+          }
+          throw err;
+        }
+
+        if (targetAccounts.length === 0) {
+          error("Error: No accounts found to scan (check --accounts, --accounts-file, or --org filters)");
+          return EXIT_CODES.ARG_ERROR;
+        }
+
+        if (!isJson && !isGitHub) {
+          log(`🌐 Multi-account sweep: scanning ${targetAccounts.length} account(s) using role '${roleName}'...`);
+        }
+
+        const sweepResult = await runMultiAccountSweep({
+          accounts: targetAccounts,
+          roleName,
+          externalId,
+          accountConcurrency,
+          olderThanDays,
+          prefix,
+          includeVersions,
+          excludeBuckets,
+          excludeRegions,
+          endpoint,
+        });
+
+        const aggregateFleetResult: FleetScanResult = {
+          bucketsDiscovered: sweepResult.totalBucketsDiscovered,
+          bucketsAudited: sweepResult.totalBucketsAudited,
+          bucketsSkipped: sweepResult.totalBucketsSkipped,
+          totalZombieUploads: sweepResult.totalZombieUploads,
+          totalStrandedBytes: sweepResult.totalStrandedBytes,
+          totalEstimatedMonthlyWasteUSD: sweepResult.totalCombinedMonthlyWasteUSD,
+          bucketResults: sweepResult.accountResults.flatMap((a) => a.fleetResult?.bucketResults ?? []),
+        };
+        const policyResult = evaluatePolicy(aggregateFleetResult, policyOptions);
+
+        if (webhookUrl) {
+          await dispatchNotification(
+            {
+              scope: "fleet",
+              target: `multi-account (${sweepResult.accountsScanned}/${sweepResult.totalAccounts} accounts)`,
+              totalZombieUploads: sweepResult.totalZombieUploads,
+              totalStrandedBytes: sweepResult.totalStrandedBytes,
+              totalEstimatedMonthlyWasteUSD: sweepResult.totalCombinedMonthlyWasteUSD,
+              bucketsDiscovered: sweepResult.totalBucketsDiscovered,
+              bucketsAudited: sweepResult.totalBucketsAudited,
+              bucketsSkipped: sweepResult.totalBucketsSkipped,
+              policyViolations: policyResult.violations.map((v) => v.message),
+            },
+            {
+              webhookUrl,
+              webhookType,
+              notifyAlways,
+            }
+          );
+        }
+
+        if (isJson) {
+          log(JSON.stringify(sweepResult, null, 2));
+          return policyResult.exitCode;
+        }
+
+        if (isGitHub) {
+          renderMultiAccountGitHub(
+            sweepResult,
+            policyResult.violations.map((v) => v.message),
+            log
+          );
+          return policyResult.exitCode;
+        }
+
+        log(`\nMulti-Account Sweep Summary:`);
+        renderMultiAccountTable(sweepResult, includeVersions, log);
+
+        const hasUnprotected = aggregateFleetResult.bucketResults.some(
+          (b) =>
+            b.status === "AUDITED" &&
+            (!b.lifecycleAudit?.hasCoveringRule ||
+              (b.lifecycleAudit?.ghostRulesDetected && b.lifecycleAudit.ghostRulesDetected.length > 0))
+        );
+        if (hasUnprotected) {
+          log(`\n💡 Tip: Run \`s3-guardian remediate --all-buckets\` to generate Terraform/CloudFormation fix.`);
+        }
+
+        if (policyResult.violations.length > 0) {
+          log(`\n❌ Policy violations detected:`);
+          for (const v of policyResult.violations) {
+            log(`  [${v.rule}] ${v.message}`);
+          }
+        }
+
+        return policyResult.exitCode;
+      }
+
       // ── Fleet mode: --all-buckets ──────────────────────────────────────────
       if (allBuckets) {
         if (!isJson && !isGitHub) {
@@ -590,6 +872,82 @@ export async function main(
 
     // ── PLAN ─────────────────────────────────────────────────────────────────
     case "plan": {
+      if (isMultiAccount) {
+        const outFile = getString(values.out) || "multi-account-plan.json";
+        log(`📝 Multi-account plan: resolving target accounts...`);
+
+        let targetAccounts: OrganizationAccount[];
+        try {
+          targetAccounts = await resolveTargetAccounts({
+            useOrg: isOrg,
+            accounts: splitCsv(accountsStr),
+            accountsFile,
+            excludeAccounts,
+          });
+        } catch (err: unknown) {
+          if (err instanceof OrganizationsDiscoveryError) {
+            error(`\n❌ Discovery failed: ${err.message}`);
+            return EXIT_CODES.DISCOVERY_AUTH_ERROR;
+          }
+          throw err;
+        }
+
+        if (targetAccounts.length === 0) {
+          error("Error: No accounts found to plan (check --accounts, --accounts-file, or --org filters)");
+          return EXIT_CODES.ARG_ERROR;
+        }
+
+        log(`📝 Multi-account plan: scanning ${targetAccounts.length} account(s) using role '${roleName}'...`);
+
+        const sweepResult = await runMultiAccountSweep({
+          accounts: targetAccounts,
+          roleName,
+          externalId,
+          accountConcurrency,
+          olderThanDays,
+          prefix,
+          includeVersions,
+          excludeBuckets,
+          excludeRegions,
+          endpoint,
+        });
+
+        const aggregateFleetResult: FleetScanResult = {
+          bucketsDiscovered: sweepResult.totalBucketsDiscovered,
+          bucketsAudited: sweepResult.totalBucketsAudited,
+          bucketsSkipped: sweepResult.totalBucketsSkipped,
+          totalZombieUploads: sweepResult.totalZombieUploads,
+          totalStrandedBytes: sweepResult.totalStrandedBytes,
+          totalEstimatedMonthlyWasteUSD: sweepResult.totalCombinedMonthlyWasteUSD,
+          bucketResults: sweepResult.accountResults.flatMap((a) => a.fleetResult?.bucketResults ?? []),
+        };
+        const policyResult = evaluatePolicy(aggregateFleetResult, policyOptions);
+
+        const { writeFile, mkdir } = await import("node:fs/promises");
+        const { dirname, resolve: pathResolve } = await import("node:path");
+        const resolvedOut = pathResolve(outFile);
+        await mkdir(dirname(resolvedOut), { recursive: true });
+        await writeFile(resolvedOut, JSON.stringify(sweepResult, null, 2), "utf8");
+
+        log(`\nMulti-account plan generated: ${outFile}`);
+        log(`  Total Accounts:           ${sweepResult.totalAccounts}`);
+        log(`  Accounts Succeeded:       ${sweepResult.accountsSucceeded}`);
+        log(`  Accounts Skipped:         ${sweepResult.accountsSkipped}`);
+        log(`  Buckets Audited:          ${sweepResult.totalBucketsAudited}`);
+        log(`  Total Zombie Uploads:     ${sweepResult.totalZombieUploads}`);
+        log(`  Total Stranded Storage:   ${formatBytes(sweepResult.totalStrandedBytes)}`);
+        log(`  Estimated Monthly Waste:  ${formatMonthlyCost(sweepResult.totalCombinedMonthlyWasteUSD)}`);
+
+        if (policyResult.violations.length > 0) {
+          log(`\n❌ Policy violations:`);
+          for (const v of policyResult.violations) {
+            log(`  [${v.rule}] ${v.message}`);
+          }
+        }
+
+        return policyResult.exitCode;
+      }
+
       if (allBuckets) {
         const outFile = getString(values.out) || "fleet-plan.json";
         log(`📝 Fleet plan: scanning all buckets (older than ${olderThanDays} days)...`);

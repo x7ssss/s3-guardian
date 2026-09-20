@@ -3,6 +3,7 @@ import { mockClient } from "aws-sdk-client-mock";
 import {
   S3Client,
   ListBucketsCommand,
+  GetBucketLocationCommand,
   ListMultipartUploadsCommand,
   ListPartsCommand,
   AbortMultipartUploadCommand,
@@ -11,6 +12,8 @@ import {
   ListObjectVersionsCommand,
   DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
+import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
+import { OrganizationsClient, ListAccountsCommand } from "@aws-sdk/client-organizations";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -18,6 +21,8 @@ import { main } from "../src/cli.js";
 import { Plan, writePlanFile } from "../src/planner/plan.js";
 
 const s3Mock = mockClient(S3Client);
+const stsMock = mockClient(STSClient);
+const orgMock = mockClient(OrganizationsClient);
 
 // Helper: stub lifecycle to return "no policy" (NoSuchLifecycleConfiguration)
 function stubNoLifecycle() {
@@ -52,6 +57,8 @@ describe("CLI entrypoint and subcommand flow", () => {
 
   beforeEach(() => {
     s3Mock.reset();
+    stsMock.reset();
+    orgMock.reset();
     stdoutLogs = [];
     stderrLogs = [];
   });
@@ -59,7 +66,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.6.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.7.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -710,5 +717,174 @@ describe("CLI entrypoint and subcommand flow", () => {
     } finally {
       await fs.unlink(tempFile).catch(() => {});
     }
+  });
+
+  it("scan --accounts executes multi-account sweep and renders executive summary table", async () => {
+    stsMock.on(AssumeRoleCommand).resolves({
+      Credentials: {
+        AccessKeyId: "ASIA_CLI_TEST",
+        SecretAccessKey: "SECRET",
+        SessionToken: "TOKEN",
+        Expiration: new Date(Date.now() + 3600_000),
+      },
+    });
+
+    s3Mock.on(ListBucketsCommand).resolves({
+      Buckets: [{ Name: "acct-bucket-1" }],
+    });
+    s3Mock.on(GetBucketLocationCommand).resolves({
+      LocationConstraint: "us-east-1",
+    });
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({ Rules: [] });
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      Uploads: [
+        {
+          Key: "large-video.mp4",
+          UploadId: "mp4-123",
+          Initiated: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+        },
+      ],
+      IsTruncated: false,
+    });
+    s3Mock.on(ListPartsCommand).resolves({
+      Parts: [{ PartNumber: 1, Size: 500 * 1024 * 1024 * 1024 }],
+      IsTruncated: false,
+    });
+
+    const code = await main(
+      ["scan", "--accounts", "111111111111,222222222222", "--role-name", "TestRole"],
+      captureIO
+    );
+
+    expect(code).toBe(0);
+    const output = stdoutLogs.join("\n");
+    expect(output).toContain("Multi-Account Sweep Summary");
+    expect(output).toContain("111111111111");
+    expect(output).toContain("222222222222");
+    expect(output).toContain("Total Accounts:        2");
+  });
+
+  it("scan --accounts --json outputs machine-readable multi-account sweep results", async () => {
+    stsMock.on(AssumeRoleCommand).resolves({
+      Credentials: {
+        AccessKeyId: "ASIA_CLI_JSON",
+        SecretAccessKey: "SECRET",
+        SessionToken: "TOKEN",
+        Expiration: new Date(Date.now() + 3600_000),
+      },
+    });
+
+    s3Mock.on(ListBucketsCommand).resolves({ Buckets: [] });
+
+    const code = await main(
+      ["scan", "--accounts", "111111111111", "--json"],
+      captureIO
+    );
+
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdoutLogs.join(""));
+    expect(parsed.totalAccounts).toBe(1);
+    expect(parsed.accountResults).toHaveLength(1);
+    expect(parsed.accountResults[0].accountId).toBe("111111111111");
+    expect(parsed.accountResults[0].status).toBe("SUCCESS");
+  });
+
+  it("scan --org discovers accounts via AWS Organizations and sweeps them", async () => {
+    orgMock.on(ListAccountsCommand).resolves({
+      Accounts: [
+        { Id: "123456789012", Name: "Prod-Account", Status: "ACTIVE" },
+      ],
+    });
+
+    stsMock.on(AssumeRoleCommand).resolves({
+      Credentials: {
+        AccessKeyId: "ASIA_CLI_ORG",
+        SecretAccessKey: "SECRET",
+        SessionToken: "TOKEN",
+        Expiration: new Date(Date.now() + 3600_000),
+      },
+    });
+
+    s3Mock.on(ListBucketsCommand).resolves({ Buckets: [] });
+
+    const code = await main(
+      ["scan", "--org", "--role-name", "OrganizationAccountAccessRole"],
+      captureIO
+    );
+
+    expect(code).toBe(0);
+    expect(stdoutLogs.join("\n")).toContain("Prod-Account");
+    expect(orgMock.commandCalls(ListAccountsCommand)).toHaveLength(1);
+  });
+
+  it("plan --accounts generates multi-account plan file on disk", async () => {
+    const tempPlanFile = path.resolve(os.tmpdir(), `multi-plan-${Date.now()}.json`);
+
+    stsMock.on(AssumeRoleCommand).resolves({
+      Credentials: {
+        AccessKeyId: "ASIA_PLAN",
+        SecretAccessKey: "SECRET",
+        SessionToken: "TOKEN",
+        Expiration: new Date(Date.now() + 3600_000),
+      },
+    });
+
+    s3Mock.on(ListBucketsCommand).resolves({ Buckets: [] });
+
+    try {
+      const code = await main(
+        ["plan", "--accounts", "111111111111", "--out", tempPlanFile],
+        captureIO
+      );
+
+      expect(code).toBe(0);
+      expect(stdoutLogs.join("\n")).toContain("Multi-account plan generated");
+
+      const fileContent = await fs.readFile(tempPlanFile, "utf8");
+      const parsedPlan = JSON.parse(fileContent);
+      expect(parsedPlan.totalAccounts).toBe(1);
+      expect(parsedPlan.accountResults[0].accountId).toBe("111111111111");
+    } finally {
+      await fs.unlink(tempPlanFile).catch(() => {});
+    }
+  });
+
+  it("scan --accounts enforces --max-waste-usd policy threshold", async () => {
+    stsMock.on(AssumeRoleCommand).resolves({
+      Credentials: {
+        AccessKeyId: "ASIA_POLICY",
+        SecretAccessKey: "SECRET",
+        SessionToken: "TOKEN",
+        Expiration: new Date(Date.now() + 3600_000),
+      },
+    });
+
+    s3Mock.on(ListBucketsCommand).resolves({
+      Buckets: [{ Name: "costly-bucket" }],
+    });
+    s3Mock.on(GetBucketLocationCommand).resolves({
+      LocationConstraint: "us-east-1",
+    });
+    s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({ Rules: [] });
+    s3Mock.on(ListMultipartUploadsCommand).resolves({
+      Uploads: [
+        {
+          Key: "big.tar",
+          UploadId: "tar-1",
+          Initiated: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+        },
+      ],
+    });
+    s3Mock.on(ListPartsCommand).resolves({
+      Parts: [{ PartNumber: 1, Size: 1000 * 1024 * 1024 * 1024 }], // 1000 GiB ($23/mo)
+    });
+
+    const code = await main(
+      ["scan", "--accounts", "111111111111", "--max-waste-usd", "5.00"],
+      captureIO
+    );
+
+    expect(code).toBe(1); // POLICY_VIOLATION
+    expect(stdoutLogs.join("\n")).toContain("Policy violations detected");
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "s3-guardian",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Local-first zero-runtime-dependency CLI to scan, quantify, and safely clean up zombie S3 multipart uploads",
   "type": "module",
   "bin": {
@@ -28,7 +28,9 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.758.0"
+    "@aws-sdk/client-organizations": "^3.1136.0",
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/client-sts": "^3.1136.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",

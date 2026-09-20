@@ -1,9 +1,20 @@
 import { acquireDaemonLock, DaemonLock } from "./lockfile.js";
+import { AuditLogWriter } from "../state/audit-writer.js";
+import { Compactor } from "../state/compaction.js";
+import { createAuditEvent, AuditEventType } from "../state/types.js";
 
 export interface DaemonTaskResult {
   wasteDetectedUSD?: number;
   message?: string;
   data?: unknown;
+  bucketName?: string;
+  accountId?: string;
+  eventType?: AuditEventType;
+  bytesFreed?: number;
+  targetCount?: number;
+  planHash?: string;
+  xAmzRequestIds?: string[];
+  circuitBreakerTripped?: boolean;
 }
 
 export interface DaemonHealthMetrics {
@@ -20,13 +31,17 @@ export interface DaemonOptions {
   intervalMs?: number;
   jitterMs?: number;
   maxRuns?: number;
-  task: (runIndex: number) => Promise<DaemonTaskResult | void>;
+  task: (runIndex: number, auditWriter?: AuditLogWriter) => Promise<DaemonTaskResult | void>;
   log?: (msg: string) => void;
   error?: (msg: string) => void;
   signal?: AbortSignal;
   targetDescription?: string;
   exitOnSignal?: boolean;
   onProgress?: (metrics: DaemonHealthMetrics) => void | Promise<void>;
+  stateDir?: string;
+  auditWriter?: AuditLogWriter;
+  s3MirrorBucket?: string;
+  autoCompactIntervalMs?: number;
 }
 
 export interface DaemonSummary {
@@ -135,6 +150,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonSummary
   // 1. Acquire single-instance lockfile
   const lock: DaemonLock = acquireDaemonLock(options.lockName);
 
+  // 1b. Initialize Audit Log Writer if stateDir or auditWriter is configured
+  const effectiveStateDir = options.stateDir ?? (options.auditWriter ? options.auditWriter.stateDir : undefined);
+  let writer: AuditLogWriter | null =
+    options.auditWriter ?? (effectiveStateDir ? new AuditLogWriter({ stateDir: effectiveStateDir }) : null);
+  const autoCompactIntervalMs = options.autoCompactIntervalMs ?? 86400000; // 24h default
+  let lastCompactTime = Date.now();
+
   // 2. Setup lifecycle state and abort handling
   const internalAbort = new AbortController();
   const effectiveSignal = options.signal
@@ -163,6 +185,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonSummary
       } catch {
         // Task errors are handled within loop
       }
+    }
+
+    if (writer) {
+      await writer.close().catch(() => {});
     }
 
     lock.release();
@@ -206,7 +232,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonSummary
 
       isTaskExecuting = true;
       try {
-        currentTaskPromise = options.task(runCount);
+        currentTaskPromise = options.task(runCount, writer ?? undefined);
         const taskResult = (await currentTaskPromise) as DaemonTaskResult | void;
         if (
           taskResult &&
@@ -215,6 +241,43 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonSummary
           typeof taskResult.wasteDetectedUSD === "number"
         ) {
           totalWasteDetectedUSD = taskResult.wasteDetectedUSD;
+        }
+
+        if (writer && taskResult && typeof taskResult === "object") {
+          const evtType: AuditEventType = taskResult.eventType ?? "DISCOVERY";
+          await writer.append(
+            createAuditEvent({
+              eventType: evtType,
+              accountId: taskResult.accountId ?? "ambient",
+              bucketName: taskResult.bucketName ?? options.lockName,
+              targetCount: taskResult.targetCount,
+              bytesFreed: taskResult.bytesFreed,
+              estimatedSavingsUSD: taskResult.wasteDetectedUSD,
+              planHash: taskResult.planHash,
+              xAmzRequestIds: taskResult.xAmzRequestIds,
+            })
+          ).catch((err) => {
+            error(`[${new Date().toISOString()}] [DAEMON] [AUDIT-ERROR] Failed to write audit event: ${err}`);
+          });
+
+          if (taskResult.circuitBreakerTripped) {
+            await writer.append(
+              createAuditEvent({
+                eventType: "CIRCUIT_BREAKER_TRIPPED",
+                accountId: taskResult.accountId ?? "ambient",
+                bucketName: taskResult.bucketName ?? options.lockName,
+              })
+            ).catch(() => {});
+          }
+        } else if (writer) {
+          await writer.append(
+            createAuditEvent({
+              eventType: "DISCOVERY",
+              accountId: "ambient",
+              bucketName: options.lockName,
+              estimatedSavingsUSD: totalWasteDetectedUSD,
+            })
+          ).catch(() => {});
         }
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -227,6 +290,22 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonSummary
       // Monotonic duration calculation (drift-free delta)
       const endHr = process.hrtime.bigint();
       lastRunDurationMs = Number(endHr - startHr) / 1_000_000;
+
+      // Periodic Compaction Check
+      if (effectiveStateDir && Date.now() - lastCompactTime >= autoCompactIntervalMs) {
+        try {
+          log(`[${new Date().toISOString()}] [DAEMON] [COMPACTION] Triggering periodic audit log compaction...`);
+          await Compactor.compactAuditLog(effectiveStateDir, {
+            writer: writer ?? undefined,
+            s3MirrorBucket: options.s3MirrorBucket,
+          });
+          lastCompactTime = Date.now();
+          writer = new AuditLogWriter({ stateDir: effectiveStateDir });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`[${new Date().toISOString()}] [DAEMON] [COMPACTION-ERROR] Periodic compaction failed: ${msg}`);
+        }
+      }
 
       // Memory inspection
       const mem = process.memoryUsage();
@@ -277,6 +356,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonSummary
       }
     }
   } finally {
+    if (writer) {
+      await writer.close().catch(() => {});
+    }
     cleanupListeners();
     lock.release();
   }

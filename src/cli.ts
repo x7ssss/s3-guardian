@@ -57,10 +57,18 @@ import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
 import { matchesExcludePattern } from "./fleet/scanner.js";
 import { detectProvider, getProviderDisplayName, S3Provider } from "./providers/index.js";
 import { launchDashboard } from "./tui/index.js";
+import {
+  AuditLogWriter,
+  Compactor,
+  readLatestSnapshot,
+  getBucketHistory,
+  createAuditEvent,
+} from "./state/index.js";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
+import * as path from "node:path";
 
-const VERSION = "1.6.0";
+const VERSION = "1.7.0";
 
 
 const HELP_TEXT = `
@@ -89,6 +97,8 @@ USAGE:
   s3-guardian drift <bucket> [options]
   s3-guardian dashboard [options]
   s3-guardian tui [options]
+  s3-guardian state compact [options]
+  s3-guardian state history <bucket> [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -104,8 +114,12 @@ COMMANDS:
   lens <source>           Zero-overhead triage and ranking from AWS Storage Lens CSV export
   drift <bucket>          Detect lifecycle configuration drift between AWS S3 and Terraform IaC
   dashboard               Interactive terminal dashboard (TUI) for fleet storage governance (alias: tui)
+  state compact           Compact audit.jsonl into a compressed snapshot and rotate log
+  state history <bucket>  Inspect historical aggregated metrics from snapshots and audit log
 
 OPTIONS:
+  --state-dir <path>           Local state directory for audit.jsonl and snapshots (default: .s3-guardian)
+  --s3-mirror <bucket>         Target S3 bucket to mirror compressed audit snapshots
   --lens <source>              Initialize dashboard triage with Storage Lens CSV export
   --tf-file <path>             Target Terraform .tf file to compare against
   --tfstate <path>             Target terraform.tfstate JSON file
@@ -716,6 +730,8 @@ export async function main(
         patch: { type: "boolean", default: false },
         write: { type: "boolean", default: false },
         lens: { type: "string" },
+        "state-dir": { type: "string" },
+        "s3-mirror": { type: "string" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -958,6 +974,8 @@ export async function main(
               lockName: "scan-fleet",
               intervalMs: daemonIntervalMs,
               maxRuns: isOnce ? 1 : undefined,
+              stateDir: getString(values["state-dir"]),
+              s3MirrorBucket: getString(values["s3-mirror"]),
               log,
               error,
               signal: io.signal,
@@ -1206,6 +1224,8 @@ export async function main(
             lockName: `scan-${bucketArg}`,
             intervalMs: daemonIntervalMs,
             maxRuns: isOnce ? 1 : undefined,
+            stateDir: getString(values["state-dir"]),
+            s3MirrorBucket: getString(values["s3-mirror"]),
             log,
             error,
             signal: io.signal,
@@ -2315,6 +2335,8 @@ export async function main(
         provider: effectiveProvider,
       };
       const client = createS3Client(effectiveClientConfig);
+      const stateDir = getString(values["state-dir"]);
+      const auditWriter = stateDir ? new AuditLogWriter({ stateDir }) : null;
 
       // Pre-flight Blast Radius Simulation
       log(`🛡️  Running pre-flight blast radius assessment on '${plan.bucket}'...`);
@@ -2338,7 +2360,23 @@ export async function main(
         forceWasabiEarlyDelete,
       });
 
+      if (auditWriter) {
+        await auditWriter.append(
+          createAuditEvent({
+            eventType: "BLAST_RADIUS_ASSESSMENT",
+            accountId: "ambient",
+            bucketName: plan.bucket,
+            planHash: plan.planHash,
+            details: {
+              findingsCount: blastRadius.findings.length,
+              isBlocked: blastRadius.isBlocked,
+            },
+          })
+        ).catch(() => {});
+      }
+
       if (blastRadius.isBlocked) {
+        if (auditWriter) await auditWriter.close().catch(() => {});
         error(`\n❌ Pre-flight blast radius check BLOCKED execution on bucket '${plan.bucket}':`);
         for (const f of blastRadius.findings.filter((f) => f.risk === "CRITICAL_BLOCKED")) {
           error(`   ⛔ [${f.code}] ${f.message}`);
@@ -2431,6 +2469,46 @@ export async function main(
             log(`  - Key: ${e.key}, UploadId: ${e.uploadId}: ${e.error}`);
           }
         }
+
+        if (auditWriter) {
+          if (!noCanary && plan.uploads.length > 0) {
+            await auditWriter.append(
+              createAuditEvent({
+                eventType: "CANARY_VERIFIED",
+                accountId: "ambient",
+                bucketName: plan.bucket,
+                targetCount: Math.min(10, plan.uploads.length),
+                planHash: plan.planHash,
+              })
+            ).catch(() => {});
+          }
+
+          await auditWriter.append(
+            createAuditEvent({
+              eventType: "REMEDIATION_EXECUTED",
+              accountId: "ambient",
+              bucketName: plan.bucket,
+              targetCount: abortResult.aborted,
+              bytesFreed: abortResult.bytesFreed,
+              estimatedSavingsUSD: plan.estimatedMonthlyWasteUSD,
+              planHash: plan.planHash,
+              xAmzRequestIds: abortResult.items?.map((i) => i.requestId).filter(Boolean) as string[],
+            })
+          ).catch(() => {});
+
+          if (abortResult.circuitBreaker?.getState() === "OPEN") {
+            await auditWriter.append(
+              createAuditEvent({
+                eventType: "CIRCUIT_BREAKER_TRIPPED",
+                accountId: "ambient",
+                bucketName: plan.bucket,
+                details: {
+                  tripReason: abortResult.circuitBreaker.getTripReason(),
+                },
+              })
+            ).catch(() => {});
+          }
+        }
       }
 
       // 2. Execute version deletions
@@ -2469,6 +2547,7 @@ export async function main(
             }
           );
         } catch (err: unknown) {
+          if (auditWriter) await auditWriter.close().catch(() => {});
           const msg = err instanceof Error ? err.message : String(err);
           error(`\n❌ Execution error: ${msg}`);
           return EXIT_CODES.POLICY_VIOLATION;
@@ -2493,6 +2572,48 @@ export async function main(
             log(`  - Key: ${e.Key}, VersionId: ${e.VersionId}: ${e.Message ?? e.Code}`);
           }
         }
+
+        if (auditWriter) {
+          if (!noCanary && entries.length > 0) {
+            await auditWriter.append(
+              createAuditEvent({
+                eventType: "CANARY_VERIFIED",
+                accountId: "ambient",
+                bucketName: plan.bucket,
+                targetCount: Math.min(10, entries.length),
+                planHash: plan.planHash,
+              })
+            ).catch(() => {});
+          }
+
+          await auditWriter.append(
+            createAuditEvent({
+              eventType: "REMEDIATION_EXECUTED",
+              accountId: "ambient",
+              bucketName: plan.bucket,
+              targetCount: versionResult.deleted,
+              planHash: plan.planHash,
+              xAmzRequestIds: versionResult.correlations?.map((c) => c.requestId).filter(Boolean) as string[],
+            })
+          ).catch(() => {});
+
+          if (versionResult.circuitBreaker?.getState() === "OPEN") {
+            await auditWriter.append(
+              createAuditEvent({
+                eventType: "CIRCUIT_BREAKER_TRIPPED",
+                accountId: "ambient",
+                bucketName: plan.bucket,
+                details: {
+                  tripReason: versionResult.circuitBreaker.getTripReason(),
+                },
+              })
+            ).catch(() => {});
+          }
+        }
+      }
+
+      if (auditWriter) {
+        await auditWriter.close().catch(() => {});
       }
 
       if (hadErrors) {
@@ -2687,6 +2808,89 @@ export async function main(
         error(`\n❌ Dashboard error: ${msg}`);
         return EXIT_CODES.ARG_ERROR;
       }
+    }
+
+    // ── STATE ────────────────────────────────────────────────────────────────
+    case "state": {
+      const subCmd = positionals[1]?.toLowerCase();
+      const stateDir = getString(values["state-dir"]) ?? path.resolve(process.cwd(), ".s3-guardian");
+      const s3Mirror = getString(values["s3-mirror"]);
+
+      if (subCmd === "compact") {
+        if (!isJson) {
+          log(`\n📦 Compacting audit log in '${stateDir}'...`);
+        }
+        try {
+          const s3Client = s3Mirror ? createS3Client(clientConfig) : undefined;
+          const result = await Compactor.compactAuditLog(stateDir, {
+            s3MirrorBucket: s3Mirror,
+            s3Client,
+          });
+
+          if (isJson) {
+            log(JSON.stringify(result, null, 2));
+            return EXIT_CODES.SUCCESS;
+          }
+
+          if (!result.snapshotPath) {
+            log("No audit events to compact (audit log empty or missing).");
+            return EXIT_CODES.SUCCESS;
+          }
+
+          log(`✅ Compaction complete!`);
+          log(`  Snapshot:         ${result.snapshotPath}`);
+          log(`  Events compacted: ${result.compactedCount}`);
+          if (s3Mirror) {
+            log(`  Mirrored to:      s3://${s3Mirror}/guardian-state/${path.basename(result.snapshotPath)}`);
+          }
+          return EXIT_CODES.SUCCESS;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`\n❌ Compaction error: ${msg}`);
+          return EXIT_CODES.POLICY_VIOLATION;
+        }
+      }
+
+      if (subCmd === "history") {
+        const targetBucket =
+          (typeof positionals[2] === "string" ? positionals[2] : undefined) ||
+          getString(values.bucket);
+
+        if (!targetBucket) {
+          error("Error: <bucket> is required for 'state history'. Usage: s3-guardian state history <bucket> [options]");
+          return EXIT_CODES.ARG_ERROR;
+        }
+
+        try {
+          const history = await getBucketHistory(stateDir, targetBucket);
+          if (isJson) {
+            log(JSON.stringify(history ?? { bucketName: targetBucket, eventCount: 0 }, null, 2));
+            return EXIT_CODES.SUCCESS;
+          }
+
+          if (!history || history.eventCount === 0) {
+            log(`\nNo historical audit events recorded for bucket '${targetBucket}' in '${stateDir}'.`);
+            return EXIT_CODES.SUCCESS;
+          }
+
+          log(`\n🛡️  Audit History for '${targetBucket}':`);
+          log(`  Account ID:             ${history.accountId}`);
+          log(`  Total Events:           ${history.eventCount}`);
+          log(`  Total Storage Freed:    ${formatBytes(history.totalBytesFreed)}`);
+          log(`  Total Savings:          ${formatMonthlyCost(history.totalEstimatedSavingsUSD)}`);
+          log(`  Circuit Breaker Trips:  ${history.circuitBreakerTrips}`);
+          log(`  Last Seen Plan Hash:    ${history.lastSeenPlanHash ?? "—"}`);
+          log(`  Last Activity:          ${history.lastEventTimestamp}`);
+          return EXIT_CODES.SUCCESS;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`\n❌ History error: ${msg}`);
+          return EXIT_CODES.POLICY_VIOLATION;
+        }
+      }
+
+      error(`Error: Unknown state subcommand '${subCmd || ""}'. Usage: s3-guardian state <compact|history> [options]`);
+      return EXIT_CODES.ARG_ERROR;
     }
 
     default: {

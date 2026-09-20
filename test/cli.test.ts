@@ -67,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.6.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.7.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1576,6 +1576,171 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
         expect(stdoutLogs.join("\n")).toContain("Circuit Breaker:      CLOSED");
       } finally {
         await fs.unlink(tempFile).catch(() => {});
+      }
+    });
+  });
+
+  describe("State Ledger & Compactor Subcommands (v1.7.0)", () => {
+    it("state command returns 2 if subcommand is missing or invalid", async () => {
+      const code1 = await main(["state"], captureIO);
+      expect(code1).toBe(2);
+      expect(stderrLogs.join("\n")).toContain("Usage: s3-guardian state <compact|history>");
+
+      stderrLogs = [];
+      const code2 = await main(["state", "unknown"], captureIO);
+      expect(code2).toBe(2);
+      expect(stderrLogs.join("\n")).toContain("Unknown state subcommand 'unknown'");
+    });
+
+    it("state compact succeeds on non-existent or empty state directory", async () => {
+      const tempStateDir = path.join(os.tmpdir(), "s3-guardian-test-state-" + Math.random().toString(36).slice(2));
+      try {
+        const code = await main(["state", "compact", "--state-dir", tempStateDir], captureIO);
+        expect(code).toBe(0);
+        expect(stdoutLogs.join("\n")).toContain("No audit events to compact");
+      } finally {
+        await fs.rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it("state compact processes events and outputs snapshot path", async () => {
+      const tempStateDir = path.join(os.tmpdir(), "s3-guardian-test-state-" + Math.random().toString(36).slice(2));
+      await fs.mkdir(tempStateDir, { recursive: true });
+      const auditLogPath = path.join(tempStateDir, "audit.jsonl");
+
+      const event = {
+        eventId: "test-event-1",
+        timestamp: new Date().toISOString(),
+        eventType: "REMEDIATION_EXECUTED",
+        accountId: "111122223333",
+        bucketName: "state-test-bucket",
+        bytesFreed: 5000000,
+        estimatedSavingsUSD: 1.25,
+      };
+      await fs.writeFile(auditLogPath, JSON.stringify(event) + "\n", "utf8");
+
+      try {
+        const code = await main(["state", "compact", "--state-dir", tempStateDir], captureIO);
+        expect(code).toBe(0);
+        expect(stdoutLogs.join("\n")).toContain("Compaction complete");
+        expect(stdoutLogs.join("\n")).toContain("Events compacted: 1");
+
+        // Verify JSON output mode
+        stdoutLogs = [];
+        await fs.writeFile(auditLogPath, JSON.stringify(event) + "\n", "utf8");
+        const jsonCode = await main(["state", "compact", "--state-dir", tempStateDir, "--json"], captureIO);
+        expect(jsonCode).toBe(0);
+        const parsed = JSON.parse(stdoutLogs.join("\n").trim());
+        expect(parsed.compactedCount).toBe(1);
+        expect(parsed.snapshotPath).toBeTruthy();
+      } finally {
+        await fs.rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it("state history requires bucket argument", async () => {
+      const code = await main(["state", "history"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join("\n")).toContain("is required for 'state history'");
+    });
+
+    it("state history reports no history for unknown bucket", async () => {
+      const tempStateDir = path.join(os.tmpdir(), "s3-guardian-test-state-" + Math.random().toString(36).slice(2));
+      try {
+        const code = await main(["state", "history", "non-existent-bucket", "--state-dir", tempStateDir], captureIO);
+        expect(code).toBe(0);
+        expect(stdoutLogs.join("\n")).toContain("No historical audit events recorded for bucket 'non-existent-bucket'");
+      } finally {
+        await fs.rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it("state history displays table and JSON output", async () => {
+      const tempStateDir = path.join(os.tmpdir(), "s3-guardian-test-state-" + Math.random().toString(36).slice(2));
+      await fs.mkdir(tempStateDir, { recursive: true });
+      const auditLogPath = path.join(tempStateDir, "audit.jsonl");
+
+      const event = {
+        eventId: "test-event-hist",
+        timestamp: "2026-09-20T12:00:00.000Z",
+        eventType: "REMEDIATION_EXECUTED",
+        accountId: "123456789012",
+        bucketName: "history-bucket",
+        bytesFreed: 1048576,
+        estimatedSavingsUSD: 0.05,
+      };
+      await fs.writeFile(auditLogPath, JSON.stringify(event) + "\n", "utf8");
+
+      try {
+        const code = await main(["state", "history", "history-bucket", "--state-dir", tempStateDir], captureIO);
+        expect(code).toBe(0);
+        expect(stdoutLogs.join("\n")).toContain("123456789012");
+        expect(stdoutLogs.join("\n")).toContain("history-bucket");
+
+        // Verify JSON output
+        stdoutLogs = [];
+        const jsonCode = await main(["state", "history", "history-bucket", "--state-dir", tempStateDir, "--json"], captureIO);
+        expect(jsonCode).toBe(0);
+        const parsed = JSON.parse(stdoutLogs.join("\n").trim());
+        expect(parsed.bucketName).toBe("history-bucket");
+        expect(parsed.totalBytesFreed).toBe(1048576);
+      } finally {
+        await fs.rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it("apply emits audit log events to --state-dir", async () => {
+      const tempStateDir = path.join(os.tmpdir(), "s3-guardian-test-state-" + Math.random().toString(36).slice(2));
+      const tempPlanFile = path.join(os.tmpdir(), "test-plan-" + Math.random().toString(36).slice(2) + ".json");
+      const plan: Plan = {
+        schemaVersion: "1.1",
+        generatedAt: new Date().toISOString(),
+        bucket: "audit-log-bucket",
+        endpoint: null,
+        olderThanDays: 7,
+        totalZombieUploads: 1,
+        totalStrandedBytes: 1024 * 1024,
+        estimatedMonthlyWasteUSD: 0.024,
+        lifecycleAudit: {
+          bucketHasLifecyclePolicy: false,
+          hasCoveringRule: false,
+          ghostRulesDetected: [],
+        },
+        uploads: [
+          {
+            key: "audit/upload/1",
+            uploadId: "upl-audit-1",
+            initiated: new Date(Date.now() - 10 * 86400000).toISOString(),
+            partsCount: 1,
+            bytes: 1024 * 1024,
+            storageClass: "STANDARD",
+            lifecycleStatus: "UNPROTECTED",
+          },
+        ],
+      };
+      await writePlanFile(tempPlanFile, plan);
+      s3Mock.on(AbortMultipartUploadCommand).resolves({});
+
+      try {
+        const code = await main(
+          ["apply", "--plan", tempPlanFile, "--confirm", "--no-canary", "--state-dir", tempStateDir],
+          captureIO
+        );
+        expect(code).toBe(0);
+
+        const auditLogPath = path.join(tempStateDir, "audit.jsonl");
+        const content = await fs.readFile(auditLogPath, "utf8");
+        const lines = content.trim().split("\n");
+        expect(lines.length).toBeGreaterThanOrEqual(1);
+
+        const events = lines.map((l) => JSON.parse(l));
+        const remEvent = events.find((e) => e.eventType === "REMEDIATION_EXECUTED");
+        expect(remEvent).toBeDefined();
+        expect(remEvent.bucketName).toBe("audit-log-bucket");
+        expect(remEvent.bytesFreed).toBe(1024 * 1024);
+      } finally {
+        await fs.unlink(tempPlanFile).catch(() => {});
+        await fs.rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
       }
     });
   });

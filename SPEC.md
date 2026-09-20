@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.6.0  
+**Version:** 1.7.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -471,3 +471,53 @@ Before executing fleet batch deletion loops across thousands of objects:
 2. **Isolated Canary Mutation:** Executes isolated deletion on the canary sample.
 3. **`HeadObject` Probe Verification:** Performs a `HeadObject` probe on each canary target to confirm deletion or delete marker placement prior to admitting the remaining fleet batch loop.
 4. **Failure Isolation:** Any failure during the canary phase immediately aborts execution, populates structured item outcomes (`ABORTED`, `SKIPPED_ALREADY_ABORTED`, `DELETED`, `FAILED`), and returns exit code 1 (`POLICY_VIOLATION`) without risking bulk mutation errors. Can be skipped when explicitly desired via `--no-canary`.
+
+---
+
+## 15. Append-Only Fleet Audit Ledger, Zero-Memory Streaming Compaction, and Atomic State Rotation (v1.7.0)
+
+### 15.1 Strictly-Typed JSONL Audit Ledger (`audit.jsonl`)
+Every mutative and diagnostic decision within `s3-guardian` emits a strictly-typed JSONL event to `${stateDir}/audit.jsonl`:
+- **Linearizable Event Types:**
+  - `DISCOVERY`: Records fleet bucket discovery, count of stranded multipart uploads, and candidate counts.
+  - `BLAST_RADIUS_ASSESSMENT`: Records pre-flight blast radius simulation results, finding counts, and safety clearance.
+  - `CANARY_VERIFIED`: Emitted upon successful completion of the pre-flight canary probe loop.
+  - `REMEDIATION_EXECUTED`: Records executed object deletions/aborts, bytes freed, estimated savings in USD, target counts, and `x-amz-request-id` correlation traces.
+  - `CIRCUIT_BREAKER_TRIPPED`: Emitted when an autonomous circuit breaker trips to `OPEN` (e.g., on consecutive 403s, 503 bursts, or 400 BadDigest quarantine).
+- **Guaranteed Serialization & Stream Backpressure:**
+  - Managed by `AuditLogWriter` with internal promise queue chaining, preventing concurrent chunk interleaving.
+  - Monitors write stream backpressure: pauses and awaits `'drain'` when the underlying Node.js stream buffer fills.
+  - Provides a clean teardown contract via `close()`, guaranteeing all in-flight buffers are flushed to disk before process exit.
+
+### 15.2 Windows NTFS Safe Atomic File Replacement (`writeAtomic`)
+File mutations (such as plan exports, checkpoints, and state files) must withstand process preemption and operating system file system quirks:
+- **Same-Directory Staging:** Temporary files are staged strictly in the destination directory (`${targetPath}.${process.pid}.${Date.now()}.${randomUUID().slice(0, 8)}.tmp`) to prevent cross-device `EXDEV` move errors.
+- **Data Flush:** File descriptor writes are forced to disk via `handle.sync()` before closing.
+- **Windows Lock Mitigation:** Windows antivirus scanners and indexing services briefly hold exclusive locks on newly written files. `writeAtomic` implements a bounded exponential backoff retry loop with full jitter on `EPERM`, `EBUSY`, and `EACCES` (up to 3,000 ms).
+- **Platform-Conditional Directory Fsync:** Safely skips directory fsync on Windows (where directory handles do not support `fsync`), while executing directory descriptor sync on POSIX platforms.
+- **Clean Failure Recovery:** Automatically unlinks staging `.tmp` files upon unrecoverable errors.
+
+### 15.3 Zero-Memory Streaming Compactor (`Compactor.compactAuditLog`)
+Long-running daemon deployments accumulate high-volume audit event logs. The compactor aggregates historical trends without generating memory pressure:
+- **Memory Footprint Bound (< 50 MB RSS):** Streams `audit.jsonl` line-by-line via `node:readline`. Never buffers raw events in memory; maintains an in-memory aggregation map keyed by `${accountId}:${bucketName}`:
+  - `totalBytesFreed`: Cumulative byte volume freed by remediation runs.
+  - `totalEstimatedSavingsUSD`: Cumulative projected FinOps savings in USD.
+  - `eventCount`: Aggregate count of processed events.
+  - `circuitBreakerTrips`: Cumulative counter of circuit breaker trips.
+  - `lastSeenPlanHash`: Most recent plan hash executed against the bucket.
+  - `lastEventTimestamp`: ISO 8601 timestamp of latest activity.
+- **Discovery Pruning:** Raw, high-volume `DISCOVERY` records are discarded from permanent storage during compaction, preserving solely the aggregated FinOps impact metrics.
+- **Atomic Multi-Step State Rotation:**
+  1. Atomically renames `audit.jsonl` to `audit.jsonl.rotating.<timestamp>` using Windows lock safety retries.
+  2. Immediately initializes a clean, empty `audit.jsonl` file to accept continuous in-flight writes without downtime.
+  3. Streams the rotating file, optionally merging baseline metrics from the latest existing snapshot.
+  4. Compresses the aggregated snapshot directly into `snapshots/snapshot-<timestamp>.json.gz` via `createGzip({ level: 9 })` and `stream.pipeline()`.
+  5. Unlinks the rotating file upon successful snapshot creation.
+- **Optional S3 Mirror Synchronization:** When configured with `--s3-mirror <bucket>`, the compactor automatically mirrors the compressed snapshot to `s3://<mirror-bucket>/guardian-state/<snapshot-name>.json.gz` via `PutObjectCommand`.
+
+### 15.4 State Inspection & CLI Operations
+- **`s3-guardian state compact`:** Manually or periodically compacts `${stateDir}/audit.jsonl` into a gzip snapshot and resets the active log.
+- **`s3-guardian state history <bucket>`:** Transparently queries and synthesizes historical metrics for a specific bucket, merging the latest historical snapshot baseline with uncompacted live events in `audit.jsonl`.
+- **Global Flags:**
+  - `--state-dir <path>`: Custom state directory for audit logging and snapshots (defaults to `./.s3-guardian`).
+  - `--s3-mirror <bucket>`: S3 bucket for mirror uploads of state snapshots.

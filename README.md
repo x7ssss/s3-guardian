@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.6.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.7.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -435,10 +435,40 @@ s3-guardian dashboard --provider minio --endpoint http://localhost:9000
 
 ---
 
+## Append-Only State Ledger, Streaming Compaction & Audit History (v1.7.0)
+
+`s3-guardian` records every diagnostic and mutative decision as a linearizable, strictly-typed JSONL event in `${stateDir}/audit.jsonl`:
+
+```bash
+# Compact active audit.jsonl into compressed snapshot (snapshots/snapshot-<timestamp>.json.gz)
+s3-guardian state compact
+
+# Compact state and mirror the compressed snapshot to a designated S3 audit bucket
+s3-guardian state compact --s3-mirror my-enterprise-audit-bucket
+
+# Inspect historical remediation and FinOps metrics for a specific bucket
+s3-guardian state history production-data-lake
+
+# Output machine-readable JSON history report
+s3-guardian state history production-data-lake --json
+```
+
+### Key Capabilities & Invariants
+- **Append-Only Serialization:** `AuditLogWriter` serializes events through an internal promise queue, preventing interleaved writes under concurrency, and respects write stream backpressure (`drain`).
+- **Zero-Memory Streaming Compaction:** `Compactor.compactAuditLog` streams `audit.jsonl` line-by-line via `node:readline`, maintaining a strict $< 50\text{ MB}$ RSS memory footprint regardless of log size. High-volume `DISCOVERY` lines are pruned while preserving per-bucket FinOps totals.
+- **Atomic Multi-Step State Rotation:** Rotates active `audit.jsonl` to `audit.jsonl.rotating.<timestamp>`, immediately initializes a clean empty `audit.jsonl`, compresses aggregates into `snapshots/snapshot-<timestamp>.json.gz`, and unlinks the rotated file upon commit.
+- **Windows NTFS Safety (`writeAtomic`):** Writes temporary files to the same directory, flushes data with `fd.sync()`, and retries with exponential backoff + full jitter (up to 3s) on transient `EPERM`/`EBUSY` locks before skipping unsupported directory fsync on Windows.
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `state compact` | command | — | Compact active audit log into compressed snapshot and rotate log |
+| `state history <bucket>` | command | — | View synthesized historical FinOps metrics and audit events for a bucket |
+| `--state-dir <path>` | string | `.s3-guardian` | Path to persistent state directory for audit ledger and snapshots |
+| `--s3-mirror <bucket>` | string | — | S3 bucket destination to mirror compressed state snapshots |
 | `dashboard` / `tui` | command | — | Interactive terminal dashboard for fleet storage governance |
 | `--lens <source>` | string | — | Initialize dashboard triage or run macroscopic ranking from Storage Lens CSV export |
 | `--provider <name>` | string | auto | Target S3 provider (`aws`, `r2`, `wasabi`, `b2`, `minio`, `ceph`, `custom`) |

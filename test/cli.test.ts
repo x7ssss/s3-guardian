@@ -66,7 +66,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.7.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.8.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -886,5 +886,74 @@ describe("CLI entrypoint and subcommand flow", () => {
 
     expect(code).toBe(1); // POLICY_VIOLATION
     expect(stdoutLogs.join("\n")).toContain("Policy violations detected");
+  });
+
+  it("lens returns 2 if source argument is missing", async () => {
+    const code = await main(["lens"], captureIO);
+    expect(code).toBe(2);
+    expect(stderrLogs.join("\n")).toContain("<source> is required for 'lens'");
+  });
+
+  it("lens renders high-density ranking table and actionable tip", async () => {
+    const tempCsv = path.resolve(os.tmpdir(), `cli-lens-${Date.now()}.csv`);
+    const csvContent = [
+      "record_type,aws_account_id,bucket_name,aws_region,storage_bytes,non_current_version_storage_bytes,delete_marker_object_count,incomplete_mpu_storage_bytes,incomplete_mpu_storage_older_than_7_days_bytes",
+      "BUCKET,111111111111,cli-waste-bucket,us-east-1,1000000000000,500000000000,5,100000000000,50000000000",
+      "BUCKET,222222222222,cli-clean-bucket,eu-west-1,500000000000,0,0,0,0",
+    ].join("\n");
+    await fs.writeFile(tempCsv, csvContent, "utf8");
+
+    try {
+      const code = await main(["lens", tempCsv], captureIO);
+      expect(code).toBe(0);
+      const output = stdoutLogs.join("\n");
+      expect(output).toContain("Storage Lens Triage & Ranking");
+      expect(output).toContain("cli-waste-bucket");
+      expect(output).toContain("cli-clean-bucket");
+      expect(output).toContain("💡 Tip: Run 's3-guardian scan cli-waste-bucket --include-versions'");
+    } finally {
+      await fs.unlink(tempCsv).catch(() => {});
+    }
+  });
+
+  it("lens --json outputs machine-readable JSON array", async () => {
+    const tempCsv = path.resolve(os.tmpdir(), `cli-lens-json-${Date.now()}.csv`);
+    const csvContent = [
+      "record_type,aws_account_id,bucket_name,aws_region,storage_bytes,non_current_version_storage_bytes,delete_marker_object_count,incomplete_mpu_storage_bytes,incomplete_mpu_storage_older_than_7_days_bytes",
+      "BUCKET,111111111111,json-bucket,us-east-1,1000000,500000,0,0,0",
+    ].join("\n");
+    await fs.writeFile(tempCsv, csvContent, "utf8");
+
+    try {
+      const code = await main(["lens", tempCsv, "--json"], captureIO);
+      expect(code).toBe(0);
+      const parsed = JSON.parse(stdoutLogs.join(""));
+      expect(Array.isArray(parsed)).toBe(true);
+      expect(parsed).toHaveLength(1);
+      expect(parsed[0].bucketName).toBe("json-bucket");
+      expect(parsed[0].wasteScore).toBe(50);
+    } finally {
+      await fs.unlink(tempCsv).catch(() => {});
+    }
+  });
+
+  it("lens --top limits output count", async () => {
+    const tempCsv = path.resolve(os.tmpdir(), `cli-lens-top-${Date.now()}.csv`);
+    const csvContent = [
+      "record_type,aws_account_id,bucket_name,aws_region,storage_bytes,non_current_version_storage_bytes,delete_marker_object_count,incomplete_mpu_storage_bytes,incomplete_mpu_storage_older_than_7_days_bytes",
+      "BUCKET,111111111111,top-b1,us-east-1,1000000,500000,0,0,0",
+      "BUCKET,111111111111,top-b2,us-east-1,1000000,400000,0,0,0",
+    ].join("\n");
+    await fs.writeFile(tempCsv, csvContent, "utf8");
+
+    try {
+      const code = await main(["lens", tempCsv, "--top", "1", "--json"], captureIO);
+      expect(code).toBe(0);
+      const parsed = JSON.parse(stdoutLogs.join(""));
+      expect(parsed).toHaveLength(1);
+      expect(parsed[0].bucketName).toBe("top-b1");
+    } finally {
+      await fs.unlink(tempCsv).catch(() => {});
+    }
   });
 });

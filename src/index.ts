@@ -145,4 +145,21 @@ export {
   MultiAccountSweepOptions,
   AccountStatus,
 } from "./multi-account/runner.js";
+export {
+  parseStorageLensCsvStream,
+  parseCsvLine,
+  detectHeaderIndices,
+  ColumnIndices,
+  DEFAULT_COLUMN_INDICES,
+} from "./lens/parser.js";
+export {
+  computeWasteScore,
+  rankStorageLensMetrics,
+  StorageLensBucketMetrics,
+  StorageLensRawMetrics,
+} from "./lens/scorer.js";
+export {
+  readStorageLensMetrics,
+  ReadStorageLensOptions,
+} from "./lens/reader.js";
 

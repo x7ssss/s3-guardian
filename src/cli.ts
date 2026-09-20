@@ -24,8 +24,10 @@ import {
   MultiAccountSweepResult,
   AccountSweepResult,
 } from "./multi-account/runner.js";
+import { readStorageLensMetrics } from "./lens/reader.js";
+import { StorageLensBucketMetrics } from "./lens/scorer.js";
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioning waste
@@ -43,6 +45,7 @@ USAGE:
   s3-guardian apply --plan <file> --confirm [options]
   s3-guardian remediate <bucket> [options]
   s3-guardian remediate --all-buckets [options]
+  s3-guardian lens <source> [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -54,6 +57,7 @@ COMMANDS:
   plan --org              Generate a multi-account organization plan (summary JSON)
   apply                   Execute aborts and version deletions defined in a plan file (requires --confirm)
   remediate <bucket>      Generate IaC fix (Terraform / CloudFormation) or apply direct rule
+  lens <source>           Zero-overhead triage and ranking from AWS Storage Lens CSV export
 
 OPTIONS:
   --older-than <days>          Age threshold in days (default: 7)
@@ -73,6 +77,8 @@ OPTIONS:
   --accounts-file <path>       File containing AWS account IDs (one per line or comma-separated)
   --exclude-account <id>       Comma-separated AWS account IDs to exclude
   --account-concurrency <n>    Max concurrent account sweeps (default: 5)
+  --top <n>                    Limit top offending buckets shown in lens (default: 20)
+  --min-waste-usd <amount>     Filter buckets below monthly waste threshold (USD)
   --exclude-bucket <patterns>  Comma-separated bucket name substrings/globs to exclude
   --exclude-region <regions>   Comma-separated AWS regions to exclude
   --max-waste-usd <amount>     Exit code 1 if total monthly waste exceeds this USD amount
@@ -102,6 +108,7 @@ SAFETY GUARANTEES:
   • 'apply' strictly requires both a valid plan file and the '--confirm' flag.
   • Fleet mode: per-bucket failures (403, 404, RequesterPays) are isolated and never abort the full scan.
   • Multi-account mode: member account failures (403, SCP, STS) never abort the multi-account audit.
+  • 'lens' operates with zero data-plane overhead, reading only macroscopic export metrics without object-level APIs.
   • Bulk deletion uses Quiet mode while unconditionally inspecting response.Errors.
 `;
 
@@ -383,6 +390,63 @@ function renderMultiAccountGitHub(
   log(``);
 }
 
+function renderLensTable(
+  metrics: StorageLensBucketMetrics[],
+  log: (msg: string) => void
+): void {
+  const padRank = 6;
+  const padAccount = 16;
+  const padBucket = 28;
+  const padStorage = 15;
+  const padWasteBytes = 15;
+  const padWastePct = 10;
+  const padWasteMo = 15;
+  const padPriority = 10;
+
+  log(
+    "Rank".padEnd(padRank) +
+    "Account".padEnd(padAccount) +
+    "Bucket".padEnd(padBucket) +
+    "Total Storage".padEnd(padStorage) +
+    "Waste Bytes".padEnd(padWasteBytes) +
+    "Waste %".padEnd(padWastePct) +
+    "Est. Waste/Mo".padEnd(padWasteMo) +
+    "Priority".padEnd(padPriority)
+  );
+  log(
+    "-".repeat(
+      padRank +
+      padAccount +
+      padBucket +
+      padStorage +
+      padWasteBytes +
+      padWastePct +
+      padWasteMo +
+      padPriority
+    )
+  );
+
+  let rank = 1;
+  for (const m of metrics) {
+    const shortBucket =
+      m.bucketName.length > padBucket - 2
+        ? m.bucketName.slice(0, padBucket - 3) + "..."
+        : m.bucketName;
+
+    log(
+      `#${rank}`.padEnd(padRank) +
+      m.accountId.padEnd(padAccount) +
+      shortBucket.padEnd(padBucket) +
+      formatBytes(m.storageBytes).padEnd(padStorage) +
+      formatBytes(m.wasteBytes).padEnd(padWasteBytes) +
+      `${m.wasteScore.toFixed(1)}%`.padEnd(padWastePct) +
+      formatMonthlyCost(m.estimatedMonthlyWasteUSD).padEnd(padWasteMo) +
+      m.priority.toFixed(1).padEnd(padPriority)
+    );
+    rank++;
+  }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function main(
@@ -415,6 +479,8 @@ export async function main(
         "accounts-file": { type: "string" },
         "exclude-account": { type: "string" },
         "account-concurrency": { type: "string", default: "5" },
+        top: { type: "string", default: "20" },
+        "min-waste-usd": { type: "string" },
         "exclude-bucket": { type: "string" },
         "exclude-region": { type: "string" },
         "max-waste-usd": { type: "string" },
@@ -500,6 +566,19 @@ export async function main(
     maxWasteUSD = parseFloat(maxWasteStr);
     if (isNaN(maxWasteUSD) || maxWasteUSD < 0) {
       error("Error: --max-waste-usd must be a non-negative number");
+      return EXIT_CODES.ARG_ERROR;
+    }
+  }
+
+  const topStr = getString(values.top) ?? "20";
+  const top = parseInt(topStr, 10) || 20;
+
+  let minWasteUSD: number | undefined;
+  const minWasteStr = getString(values["min-waste-usd"]);
+  if (minWasteStr !== undefined) {
+    minWasteUSD = parseFloat(minWasteStr);
+    if (isNaN(minWasteUSD) || minWasteUSD < 0) {
+      error("Error: --min-waste-usd must be a non-negative number");
       return EXIT_CODES.ARG_ERROR;
     }
   }
@@ -1391,6 +1470,56 @@ export async function main(
       }
 
       log("\n✅ Done! Cleanup completed successfully.");
+      return EXIT_CODES.SUCCESS;
+    }
+
+    // ── LENS ─────────────────────────────────────────────────────────────────
+    case "lens": {
+      const sourceArg =
+        (typeof positionals[1] === "string" ? positionals[1] : undefined) ||
+        getString(values.source);
+
+      if (!sourceArg) {
+        error("Error: <source> is required for 'lens'. Usage: s3-guardian lens <path-or-s3-uri>");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (!isJson) {
+        log(`🔍 Reading Storage Lens export from '${sourceArg}'...`);
+      }
+
+      const client = createS3Client(clientConfig);
+      let metrics: StorageLensBucketMetrics[];
+
+      try {
+        metrics = await readStorageLensMetrics(client, sourceArg, {
+          top,
+          minWasteUSD,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        error(`\n❌ Failed to read Storage Lens metrics: ${msg}`);
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (isJson) {
+        log(JSON.stringify(metrics, null, 2));
+        return EXIT_CODES.SUCCESS;
+      }
+
+      if (metrics.length === 0) {
+        log("\nNo bucket metrics found matching criteria.");
+        return EXIT_CODES.SUCCESS;
+      }
+
+      log(`\nStorage Lens Triage & Ranking (Top ${metrics.length}):\n`);
+      renderLensTable(metrics, log);
+
+      const topOffender = metrics[0]?.bucketName;
+      log(
+        `\n💡 Tip: Run 's3-guardian scan ${topOffender} --include-versions' to inspect and generate a plan for the top offenders.\n`
+      );
+
       return EXIT_CODES.SUCCESS;
     }
 

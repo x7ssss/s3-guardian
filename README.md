@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.2.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.3.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -304,10 +304,59 @@ CMD ["scan", "--all-buckets", "--daemon", "--interval", "1h"]
 
 ---
 
+### 8. `drift`: Terraform Lifecycle Drift Detection & Git Patch Generation
+
+Detects discrepancies between deployed AWS S3 lifecycle rules and local Terraform Infrastructure as Code definitions (`.tf` source files or `terraform.tfstate` state files). Automatically generates standard POSIX unified diffs directly applicable via `git apply`.
+
+#### Core Capabilities:
+- **Terraform State (v4) Parsing:** Ingests `terraform.tfstate` to extract `aws_s3_bucket_lifecycle_configuration` and legacy `aws_s3_bucket` managed lifecycle rules without requiring a Terraform binary or network state lock.
+- **Direct HCL Source Inspection:** Analyzes local `.tf` files to identify missing rule blocks, threshold drifts, and missing safety filters.
+- **POSIX Unified Diff Patches:** Emits standard `--- a/path\n+++ b/path` unified diffs inserting missing `abort_incomplete_multipart_upload` blocks, version expirations, and `object_size_greater_than = 131072` transition trap filters.
+- **Automated In-Place Patching:** When invoked with `--write`, atomically patches the local `.tf` file in place, achieving GitOps-first remediation with zero manual syntax errors.
+- **Ghost Rule Flagging:** Identifies rules with Tag filters attached to MPU abort actions (which AWS S3 silently ignores).
+
+#### CLI Usage Examples:
+
+```bash
+# Compare live S3 bucket against local Terraform source file
+s3-guardian drift my-bucket --tf-file main.tf
+
+# Compare live S3 bucket against terraform.tfstate JSON
+s3-guardian drift my-bucket --tfstate terraform.tfstate
+
+# Preview POSIX unified diff patch directly to stdout
+s3-guardian drift my-bucket --tf-file main.tf --patch
+
+# Apply patch directly to the .tf file in place
+s3-guardian drift my-bucket --tf-file main.tf --write
+
+# Output machine-readable JSON drift report for CI/CD pipelines
+s3-guardian drift my-bucket --tfstate terraform.tfstate --json
+```
+
+Terminal Output Table:
+```
+Bucket                      Resource Type                             IaC State    Live State   Drift Status
+--------------------------------------------------------------------------------------------------------------------
+production-data-lake        aws_s3_bucket_lifecycle_configuration    1 Rule(s)    2 Rule(s)    ❌ DRIFT_DETECTED
+
+Drift Details & Safety Gaps (2):
+  - Unmanaged rule in AWS S3: 'ad-hoc-manual-rule' (present in live cloud but missing in IaC)
+  - Safety gap: Transition rule 'archive-tier' lacks object_size_greater_than >= 128 KiB filter (small-object penalty trap)
+
+💡 Tip: Run `s3-guardian drift production-data-lake --tf-file main.tf --patch` to view unified diff patch, or `--write` to apply automatically.
+```
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `--tf-file <path>` | string | — | Target Terraform `.tf` source file to compare against |
+| `--tfstate <path>` | string | — | Target `terraform.tfstate` JSON file |
+| `--patch` | flag | `false` | Output POSIX unified diff patch directly to stdout |
+| `--write` | flag | `false` | Atomically update the target `.tf` file in-place with patch applied |
 | `--daemon` | flag | `false` | Continuous in-process daemon execution mode |
 | `--interval <duration>` | string | `1h` | Interval between daemon runs (`10s`, `30m`, `1h`, `12h`, `24h`) |
 | `--once` | flag | `false` | Run exactly one iteration in daemon harness (validates lock & metrics) |

@@ -223,4 +223,20 @@ export {
   DaemonHealthMetrics,
   DaemonSummary,
 } from "./daemon/index.js";
+export {
+  parseTerraformState,
+  ManagedLifecycleRule,
+  ManagedBucketLifecycle,
+  TerraformStateParseResult,
+  createUnifiedDiff,
+  generateHclPatch,
+  DriftRecommendations,
+  HclPatchResult,
+  detectLifecycleDrift,
+  parseHclLifecycleRules,
+  DetectLifecycleDriftOptions,
+  LifecycleDriftResult,
+  DriftStatus,
+} from "./drift/index.js";
+
 

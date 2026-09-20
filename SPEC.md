@@ -1,6 +1,6 @@
 # s3-guardian — Technical Specification & Invariants
 
-**Version:** 1.2.0  
+**Version:** 1.3.0  
 **Classification:** Enterprise System Architecture & Protocol Specification  
 **Status:** Approved for Production  
 
@@ -310,3 +310,44 @@ To prevent concurrent conflicting daemon runs on the same system:
 - `--interval <duration>`: Configures schedule interval. Accepts human shorthand: `10s`, `30m`, `1h`, `12h`, `24h`, `500ms`, or raw milliseconds.
 - `--once`: Executes exactly one iteration in the daemon harness (useful for validating lock acquisition, execution pipeline, and metrics in CI/CD or smoke testing).
 - Supported commands: `scan <bucket> --daemon`, `scan --all-buckets --daemon`, `audit-transitions <bucket> --daemon`, `audit-transitions --all-buckets --daemon`.
+
+---
+
+## 11. Terraform Lifecycle Drift Detection & Unified Git Patch Protocol (v1.3.0)
+
+### 11.1 Native Architecture & Core Invariants
+To maintain enterprise compliance without out-of-band state mutation:
+1. **Zero Third-Party Parser or Diff Libraries:** Operates 100% on Node.js 20+ runtime built-ins. Incorporates native POSIX unified diff generation and native Terraform state v4 JSON parsing.
+2. **Read-Only State Inspection:** Drift detection queries live AWS S3 lifecycle rules and reads local `.tf` or `.tfstate` files without modifying any cloud resources or local files, unless `--write` is explicitly passed.
+3. **Standard POSIX Unified Diff Format:** Generated patches comply with standard POSIX unified diff specification (`--- a/path\n+++ b/path\n@@ -start,count +start,count @@`), directly applicable via `git apply`.
+
+### 11.2 Terraform State (v4) Ingestion Protocol
+The `parseTerraformState` engine reads raw `terraform.tfstate` JSON:
+1. Validates schema version (`version === 4`).
+2. Scans `resources` for:
+   - `aws_s3_bucket_lifecycle_configuration`: Extracts target bucket name (`attributes.bucket` or `attributes.id`) and iterates `attributes.rule` array.
+   - `aws_s3_bucket`: Extracts target bucket name and iterates legacy `attributes.lifecycle_rule` array.
+   - Dedicated `aws_s3_bucket_lifecycle_configuration` overrides legacy `aws_s3_bucket` definitions when both target the same bucket.
+3. Normalizes attributes into `ManagedLifecycleRule` objects:
+   - `abortIncompleteMultipartUploadDays`: Extracted from `abort_incomplete_multipart_upload[0].days_after_initiation`.
+   - `noncurrentVersionExpirationDays`: Extracted from `noncurrent_version_expiration[0].noncurrent_days`.
+   - `expiredObjectDeleteMarker`: Boolean flag from `expiration[0].expired_object_delete_marker`.
+   - `transitions` / `noncurrentVersionTransitions`: Storage classes, days, and dates.
+   - `objectSizeGreaterThan`: Integer minimum byte filter from `filter[0].object_size_greater_than`.
+
+### 11.3 HCL Patcher & Unified Git Diff Generation
+`generateHclPatch` inspects target HCL `.tf` files and performs surgical insertions:
+1. **Missing Resource Handling:** If no `aws_s3_bucket_lifecycle_configuration` resource block exists for the bucket, a complete modern resource block is synthesized and appended.
+2. **Missing MPU Abort Insertion:** If the resource lacks an `abort_incomplete_multipart_upload` block, an enabled rule (`s3-guardian-abort-mpu`) is injected before the closing brace of the resource block.
+3. **Small-Object Transition Trap Constraining:** Transition rules targeting `GLACIER`, `STANDARD_IA`, `ONEZONE_IA`, `GLACIER_IR`, or `DEEP_ARCHIVE` lacking an `object_size_greater_than` filter have `object_size_greater_than = 131072` injected into their `filter` block, preserving existing prefix or tag filters.
+4. **POSIX Unified Diff Computation:** `createUnifiedDiff` computes the Longest Common Subsequence (LCS) edit script and formats hunks with 3 lines of contextual padding.
+
+### 11.4 Drift Detection Status Resolution
+`detectLifecycleDrift` evaluates discrepancies across five dimensions:
+- `IN_SYNC`: All live AWS rules exist in IaC with identical thresholds, status, and safety filters.
+- `GHOST_CONFIG`: Either live S3 or IaC declares an MPU abort rule with a Tag filter (which AWS S3 silently ignores).
+- `DRIFT_DETECTED`:
+  - **Unmanaged Rules:** Rule present in AWS S3 but absent in IaC.
+  - **Missing Rules:** Rule declared in IaC but absent in live AWS S3.
+  - **Threshold Drifts:** Days after initiation, noncurrent days, status, or transition targets differ.
+  - **Safety Gaps:** Bucket lacks an MPU abort rule in IaC, or transition rules lack small-object filters.

@@ -67,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.2.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.3.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1177,6 +1177,134 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(output).toContain("[DAEMON] [STARTUP]");
     expect(output).toContain("Target: Bucket transition audit (trans-bucket)");
     expect(output).toContain("[DAEMON] [RUN #1]");
+  });
+
+  describe("drift command", () => {
+    const tmpDir = os.tmpdir();
+    const testTfFile = path.join(tmpDir, `test-drift-${Math.random().toString(36).slice(2, 8)}.tf`);
+    const testTfStateFile = path.join(tmpDir, `test-drift-${Math.random().toString(36).slice(2, 8)}.tfstate`);
+
+    afterEach(async () => {
+      try {
+        await fs.unlink(testTfFile);
+      } catch {}
+      try {
+        await fs.unlink(testTfStateFile);
+      } catch {}
+    });
+
+    it("returns 2 if bucket name is missing", async () => {
+      const code = await main(["drift"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'drift'");
+    });
+
+    it("returns 2 if neither --tf-file nor --tfstate is provided", async () => {
+      const code = await main(["drift", "my-bucket"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("Either --tf-file <path> or --tfstate <path> must be provided");
+    });
+
+    it("returns 2 if --tf-file does not exist", async () => {
+      const code = await main(["drift", "my-bucket", "--tf-file", "nonexistent-file.tf"], captureIO);
+      expect(code).toBe(2);
+      expect(stderrLogs.join(" ")).toContain("Target Terraform file not found");
+    });
+
+    it("evaluates drift using --tfstate and returns code 0 when IN_SYNC", async () => {
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [
+          {
+            ID: "s3-guardian-abort-mpu",
+            Status: "Enabled",
+            Filter: {},
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 },
+          },
+        ],
+      });
+
+      const tfstate = JSON.stringify({
+        version: 4,
+        resources: [
+          {
+            mode: "managed",
+            type: "aws_s3_bucket_lifecycle_configuration",
+            name: "test",
+            instances: [
+              {
+                attributes: {
+                  bucket: "sync-bucket",
+                  rule: [
+                    {
+                      id: "s3-guardian-abort-mpu",
+                      status: "Enabled",
+                      abort_incomplete_multipart_upload: [{ days_after_initiation: 7 }],
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+      await fs.writeFile(testTfStateFile, tfstate, "utf8");
+
+      const code = await main(["drift", "sync-bucket", "--tfstate", testTfStateFile, "--json"], captureIO);
+      expect(code).toBe(0);
+
+      const parsed = JSON.parse(stdoutLogs.join(""));
+      expect(parsed.status).toBe("IN_SYNC");
+      expect(parsed.isDrifted).toBe(false);
+      expect(parsed.bucketName).toBe("sync-bucket");
+    });
+
+    it("outputs unified diff when --patch is passed", async () => {
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [],
+      });
+
+      const initialTf = `
+resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_patch_bucket" {
+  bucket = "patch-bucket"
+}
+`.trim();
+      await fs.writeFile(testTfFile, initialTf, "utf8");
+
+      const code = await main(["drift", "patch-bucket", "--tf-file", testTfFile, "--patch"], captureIO);
+      expect(code).toBe(0);
+
+      const patchOutput = stdoutLogs.join("\n");
+      expect(patchOutput).toContain("--- a/");
+      expect(patchOutput).toContain("+++ b/");
+      expect(patchOutput).toContain("+    id     = \"s3-guardian-abort-mpu\"");
+    });
+
+    it("applies patch to file when --write is passed and renders drift table", async () => {
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [],
+      });
+
+      const initialTf = `
+resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
+  bucket = "write-bucket"
+}
+`.trim();
+      await fs.writeFile(testTfFile, initialTf, "utf8");
+
+      const code = await main(["drift", "write-bucket", "--tf-file", testTfFile, "--write"], captureIO);
+      // Returns 1 because drift was detected (before write)
+      expect(code).toBe(1);
+
+      const tableOutput = stdoutLogs.join("\n");
+      expect(tableOutput).toContain("Resource Type");
+      expect(tableOutput).toContain("Drift Status");
+      expect(tableOutput).toContain("DRIFT_DETECTED");
+      expect(tableOutput).toContain("Successfully applied drift remediation patch");
+
+      // Verify file was mutated on disk
+      const updatedContent = await fs.readFile(testTfFile, "utf8");
+      expect(updatedContent).toContain("s3-guardian-abort-mpu");
+    });
   });
 });
 

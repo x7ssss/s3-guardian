@@ -45,14 +45,20 @@ import {
   DaemonLockError,
 } from "./daemon/index.js";
 import {
+  detectLifecycleDrift,
+  LifecycleDriftResult,
+} from "./drift/index.js";
+import {
   generateTerraformTransitionRemediation,
   generateCloudFormationTransitionRemediation,
 } from "./remediation/iac.js";
 import { ListBucketsCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3";
 import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
 import { matchesExcludePattern } from "./fleet/scanner.js";
+import * as fsPromises from "node:fs/promises";
+import * as fsSync from "node:fs";
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning waste, and transition traps
@@ -77,6 +83,7 @@ USAGE:
   s3-guardian remediate <bucket> [options]
   s3-guardian remediate --all-buckets [options]
   s3-guardian lens <source> [options]
+  s3-guardian drift <bucket> [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -90,8 +97,13 @@ COMMANDS:
   apply                   Execute aborts and version deletions defined in a plan file (requires --confirm)
   remediate <bucket>      Generate IaC fix (Terraform / CloudFormation) or apply direct rule
   lens <source>           Zero-overhead triage and ranking from AWS Storage Lens CSV export
+  drift <bucket>          Detect lifecycle configuration drift between AWS S3 and Terraform IaC
 
 OPTIONS:
+  --tf-file <path>             Target Terraform .tf file to compare against
+  --tfstate <path>             Target terraform.tfstate JSON file
+  --patch                      Output unified diff patch directly to stdout
+  --write                      Atomically update the target .tf file in-place with the patch applied
   --daemon                     Continuous in-process daemon mode
   --interval <duration>        Daemon execution interval (e.g. 1h, 30m, 12h, 24h, default: 1h)
   --once                       Execute exactly one iteration in daemon harness (validates lock & metrics)
@@ -580,6 +592,52 @@ function renderTransitionTable(
   );
 }
 
+function renderDriftTable(
+  result: LifecycleDriftResult,
+  log: (msg: string) => void
+): void {
+  const padBucket = 28;
+  const padResType = 42;
+  const padIac = 14;
+  const padLive = 14;
+  const padStatus = 20;
+
+  log(
+    "Bucket".padEnd(padBucket) +
+    "Resource Type".padEnd(padResType) +
+    "IaC State".padEnd(padIac) +
+    "Live State".padEnd(padLive) +
+    "Drift Status".padEnd(padStatus)
+  );
+  log("-".repeat(padBucket + padResType + padIac + padLive + padStatus));
+
+  const statusDisplay =
+    result.status === "IN_SYNC"
+      ? "✅ IN_SYNC"
+      : result.status === "GHOST_CONFIG"
+      ? "⚠️ GHOST_CONFIG"
+      : "❌ DRIFT_DETECTED";
+
+  const shortBucket =
+    result.bucketName.length > padBucket - 2
+      ? result.bucketName.slice(0, padBucket - 3) + "..."
+      : result.bucketName;
+
+  const resTypeDisplay = result.resourceType ?? "(unmanaged in IaC)";
+  const shortResType =
+    resTypeDisplay.length > padResType - 2
+      ? resTypeDisplay.slice(0, padResType - 3) + "..."
+      : resTypeDisplay;
+
+  log(
+    shortBucket.padEnd(padBucket) +
+    shortResType.padEnd(padResType) +
+    `${result.iacRulesCount} Rule(s)`.padEnd(padIac) +
+    `${result.liveRulesCount} Rule(s)`.padEnd(padLive) +
+    statusDisplay.padEnd(padStatus)
+  );
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function main(
@@ -634,6 +692,10 @@ export async function main(
         daemon: { type: "boolean", default: false },
         interval: { type: "string", default: "1h" },
         once: { type: "boolean", default: false },
+        "tf-file": { type: "string" },
+        tfstate: { type: "string" },
+        patch: { type: "boolean", default: false },
+        write: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -2395,6 +2457,105 @@ export async function main(
       );
 
       return EXIT_CODES.SUCCESS;
+    }
+
+    // ── DRIFT ────────────────────────────────────────────────────────────────
+    case "drift": {
+      const bucketName = bucketArg;
+      if (!bucketName) {
+        error("Error: Bucket name is required for 'drift'. Usage: s3-guardian drift <bucket> [options]");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      const tfFile = getString(values["tf-file"]);
+      const tfStateFile = getString(values.tfstate);
+      const isPatch = values.patch === true;
+      const isWrite = values.write === true;
+
+      if (!tfFile && !tfStateFile) {
+        error("Error: Either --tf-file <path> or --tfstate <path> must be provided for 'drift'");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (tfFile && !fsSync.existsSync(tfFile)) {
+        error(`Error: Target Terraform file not found: '${tfFile}'`);
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (tfStateFile && !fsSync.existsSync(tfStateFile)) {
+        error(`Error: Target Terraform state file not found: '${tfStateFile}'`);
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (isWrite && !tfFile) {
+        error("Error: --write requires --tf-file <path> to apply the patch");
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      const client = createS3Client(clientConfig);
+      let driftResult: LifecycleDriftResult;
+
+      try {
+        driftResult = await detectLifecycleDrift(client, bucketName, {
+          tfFile,
+          tfStateFile,
+          generatePatch: true,
+          prefix,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        error(`\n❌ Drift detection failed: ${msg}`);
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      if (isWrite) {
+        if (driftResult.patchedTfContent && tfFile && driftResult.patch) {
+          try {
+            await fsPromises.writeFile(tfFile, driftResult.patchedTfContent, "utf8");
+            log(`\n✅ Successfully applied drift remediation patch to '${tfFile}'`);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            error(`\n❌ Failed to write patched file '${tfFile}': ${msg}`);
+            return EXIT_CODES.ARG_ERROR;
+          }
+        } else {
+          log(`\nℹ️  No changes needed for '${tfFile}'. File is already up to date.`);
+        }
+      }
+
+      if (isPatch) {
+        if (driftResult.patch) {
+          log(driftResult.patch.trimEnd());
+        } else {
+          log("# No drift detected; files are in sync.");
+        }
+        return EXIT_CODES.SUCCESS;
+      }
+
+      if (isJson) {
+        log(JSON.stringify(driftResult, null, 2));
+        return driftResult.isDrifted ? EXIT_CODES.POLICY_VIOLATION : EXIT_CODES.SUCCESS;
+      }
+
+      log(`\n🔍 S3 Lifecycle Drift Assessment: '${bucketName}'\n`);
+      renderDriftTable(driftResult, log);
+
+      if (driftResult.differences.length > 0) {
+        log(`\nDrift Details & Safety Gaps (${driftResult.differences.length}):`);
+        for (const diff of driftResult.differences) {
+          log(`  - ${diff}`);
+        }
+      }
+
+      if (driftResult.patch && tfFile) {
+        if (!isWrite) {
+          log(
+            `\n💡 Tip: Run \`s3-guardian drift ${bucketName} --tf-file ${tfFile} --patch\` to view unified diff patch, or \`--write\` to apply automatically.\n`
+          );
+        }
+      }
+
+      return driftResult.isDrifted ? EXIT_CODES.POLICY_VIOLATION : EXIT_CODES.SUCCESS;
     }
 
     default: {

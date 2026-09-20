@@ -55,7 +55,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.2.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v0.3.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -69,15 +69,15 @@ describe("CLI entrypoint and subcommand flow", () => {
     expect(stdoutLogs.join(" ")).toContain("USAGE:");
   });
 
-  it("returns 1 for unknown command", async () => {
+  it("returns 2 for unknown command", async () => {
     const code = await main(["foobar"], captureIO);
-    expect(code).toBe(1);
+    expect(code).toBe(2);
     expect(stderrLogs.join(" ")).toContain("Unknown command 'foobar'");
   });
 
-  it("scan returns 1 if bucket is omitted", async () => {
+  it("scan returns 2 if bucket is omitted", async () => {
     const code = await main(["scan"], captureIO);
-    expect(code).toBe(1);
+    expect(code).toBe(2);
     expect(stderrLogs.join(" ")).toContain("Bucket name is required for 'scan'");
   });
 
@@ -325,7 +325,7 @@ describe("CLI entrypoint and subcommand flow", () => {
     try {
       // Without --confirm
       const code = await main(["apply", "--plan", tempFile], captureIO);
-      expect(code).toBe(1);
+      expect(code).toBe(2);
       expect(stderrLogs.join(" ")).toContain("Safety check failed: The '--confirm' flag is strictly required");
       expect(s3Mock.calls().length).toBe(0);
     } finally {

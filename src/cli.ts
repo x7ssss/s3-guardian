@@ -56,10 +56,12 @@ import { ListBucketsCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3
 import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
 import { matchesExcludePattern } from "./fleet/scanner.js";
 import { detectProvider, getProviderDisplayName, S3Provider } from "./providers/index.js";
+import { launchDashboard } from "./tui/index.js";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
+
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning waste, and transition traps
@@ -85,6 +87,8 @@ USAGE:
   s3-guardian remediate --all-buckets [options]
   s3-guardian lens <source> [options]
   s3-guardian drift <bucket> [options]
+  s3-guardian dashboard [options]
+  s3-guardian tui [options]
 
 COMMANDS:
   scan <bucket>           Read-only scan of incomplete multipart uploads
@@ -99,8 +103,10 @@ COMMANDS:
   remediate <bucket>      Generate IaC fix (Terraform / CloudFormation) or apply direct rule
   lens <source>           Zero-overhead triage and ranking from AWS Storage Lens CSV export
   drift <bucket>          Detect lifecycle configuration drift between AWS S3 and Terraform IaC
+  dashboard               Interactive terminal dashboard (TUI) for fleet storage governance (alias: tui)
 
 OPTIONS:
+  --lens <source>              Initialize dashboard triage with Storage Lens CSV export
   --tf-file <path>             Target Terraform .tf file to compare against
   --tfstate <path>             Target terraform.tfstate JSON file
   --patch                      Output unified diff patch directly to stdout
@@ -173,6 +179,8 @@ export interface CliOptions {
   stdout?: (msg: string) => void;
   stderr?: (msg: string) => void;
   signal?: AbortSignal;
+  isTTY?: boolean;
+  stdin?: NodeJS.ReadStream;
 }
 
 function getString(val: unknown): string | undefined {
@@ -701,6 +709,7 @@ export async function main(
         tfstate: { type: "string" },
         patch: { type: "boolean", default: false },
         write: { type: "boolean", default: false },
+        lens: { type: "string" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -2588,6 +2597,43 @@ export async function main(
       }
 
       return driftResult.isDrifted ? EXIT_CODES.POLICY_VIOLATION : EXIT_CODES.SUCCESS;
+    }
+
+    // ── DASHBOARD (TUI) ──────────────────────────────────────────────────────
+    case "dashboard":
+    case "tui": {
+      const isTTY = io.isTTY !== undefined ? io.isTTY : Boolean(process.stdin.isTTY);
+      if (!isTTY) {
+        error(
+          "Error: Interactive dashboard requires an interactive terminal (TTY). Run 's3-guardian scan --all-buckets' for non-interactive / CI environments."
+        );
+        return EXIT_CODES.ARG_ERROR;
+      }
+
+      const lensSource =
+        (typeof positionals[1] === "string" ? positionals[1] : undefined) ||
+        getString(values.lens);
+      const client = createS3Client(clientConfig);
+
+      try {
+        await launchDashboard(client, {
+          lensSource,
+          provider: detectedProvider,
+          endpoint,
+          olderThanDays,
+          prefix,
+          roleName,
+          externalId,
+          signal: io.signal,
+          stream: io.stdout ? { write: (chunk: string) => io.stdout!(chunk) } : undefined,
+          stdin: io.stdin,
+        });
+        return EXIT_CODES.SUCCESS;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        error(`\n❌ Dashboard error: ${msg}`);
+        return EXIT_CODES.ARG_ERROR;
+      }
     }
 
     default: {

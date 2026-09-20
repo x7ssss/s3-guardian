@@ -1,6 +1,6 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.4.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.5.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -386,10 +386,49 @@ Wasabi enforces a **90-day minimum retention charge** on stored data. Prematurel
 
 ---
 
+### 11. `dashboard` (TUI): Interactive Fleet Storage Governance Navigator
+
+A terminal UI dashboard powered purely by native Node.js 20+ ANSI escape codes and alternate screen buffer hygiene. Browse buckets, inspect stranded storage, expand the detail inspector drawer, and generate remediation plans on the fly.
+
+```bash
+# Launch interactive dashboard across all fleet buckets
+s3-guardian dashboard
+
+# Or use the concise alias
+s3-guardian tui
+
+# Initialize instant zero data-plane triage from Storage Lens CSV export
+s3-guardian dashboard --lens s3://my-inventory-bucket/lens/daily-export.csv
+s3-guardian dashboard --lens /path/to/local-storage-lens-report.csv
+
+# Multi-cloud & custom endpoints
+s3-guardian dashboard --provider minio --endpoint http://localhost:9000
+```
+
+#### Hotkey Controls
+
+| Hotkey | Action | Description |
+| :--- | :--- | :--- |
+| `↑` / `k` | **Navigate Up** | Move cursor up in the bucket list (with auto-scroll clamping) |
+| `↓` / `j` | **Navigate Down** | Move cursor down in the bucket list |
+| `Enter` | **Detail Inspector** | Expand/collapse selected bucket drawer (region, provider, oldest upload date, EODM count, lifecycle rule status, ghost rules) |
+| `p` | **Create Plan** | Asynchronously generate an immutable, RFC 8785 signed `plan-<bucket>.json` in the background |
+| `r` | **Refresh** | Asynchronously re-scan fleet metrics across accounts and regions without freezing the UI |
+| `q` / `Esc` / `Ctrl+C` | **Quit** | Cleanly exit dashboard and restore primary terminal screen buffer |
+
+#### Terminal Hygiene & CI Safety
+- **Clean Alternate Screen Buffer:** `s3-guardian` switches to the terminal's alternate screen buffer (`\x1b[?1049h`) and hides the cursor (`\x1b[?25l`). On exit or interrupt signals (`SIGINT`, `SIGTERM`, `uncaughtException`), it unconditionally restores the primary screen buffer (`\x1b[?1049l`) and re-enables cursor visibility (`\x1b[?25h`).
+- **Non-TTY Protection:** If launched in headless CI pipelines or piped commands without an interactive TTY (`!process.stdin.isTTY`), the dashboard cleanly halts with exit code 2 and prompts:
+  `Error: Interactive dashboard requires an interactive terminal (TTY). Run 's3-guardian scan --all-buckets' for non-interactive / CI environments.`
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `dashboard` / `tui` | command | — | Interactive terminal dashboard for fleet storage governance |
+| `--lens <source>` | string | — | Initialize dashboard triage or run macroscopic ranking from Storage Lens CSV export |
 | `--provider <name>` | string | auto | Target S3 provider (`aws`, `r2`, `wasabi`, `b2`, `minio`, `ceph`, `custom`) |
 | `--force-wasabi-early-delete` | flag | `false` | Bypass Wasabi 90-day retention guard for uploads/versions < 90 days old |
 | `--tf-file <path>` | string | — | Target Terraform `.tf` source file to compare against |

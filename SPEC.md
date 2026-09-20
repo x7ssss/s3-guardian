@@ -400,3 +400,38 @@ Wasabi enforces a strict 90-day minimum retention charge policy: deleting object
    - Bypassing this safety gate strictly requires the `--force-wasabi-early-delete` flag.
 3. **Executor-Level Enforcement:**
    - Both `executeAbortPlan` and `executeVersionDeletion` directly enforce the Wasabi 90-day check, throwing a descriptive safety error if young targets are passed without `forceWasabiEarlyDelete: true`.
+
+---
+
+## 13. Interactive Terminal Dashboard & TUI Architecture (v1.5.0)
+
+### 13.1 Design Principles & Invariants
+1. **Zero External TUI Dependencies:** Built strictly on Node.js 20+ built-ins (`process.stdin.setRawMode`, ANSI escape sequences, `node:events`, `node:readline`). Strictly ZERO dependencies on `ink`, `blessed`, or `cli-cursor`.
+2. **Strict Terminal Hygiene Protocol:**
+   - On initialization, executes `enterAltScreen()` (`\x1b[?1049h`) to switch into the private alternate terminal screen buffer and `hideCursor()` (`\x1b[?25l`).
+   - Hooks one-time signal handlers on `SIGINT`, `SIGTERM`, and `uncaughtException`.
+   - On normal termination or interruption, unconditionally restores cursor visibility (`\x1b[?25h`) and the primary screen buffer (`\x1b[?1049l`), ensuring zero shell corruption.
+3. **Non-Blocking Navigation:** Decoupled state reducer and event loop guarantee keypress interactions remain responsive and unblocked while network operations (`scanFleet`, `readStorageLensMetrics`, plan generation) run asynchronously in the background.
+4. **TTY Protection Guard:**
+   - Inspects `process.stdin.isTTY` prior to terminal initialization.
+   - When executed in non-interactive CI/CD pipelines or piping environments, cleanly exits with exit code 2 (`ARG_ERROR`), directing users to batch mode: `s3-guardian scan --all-buckets`.
+
+### 13.2 Hotkey Navigation & Interaction Model
+- **`[↑]` / `[k]`:** Move selection up with view clamping and scroll synchronization.
+- **`[↓]` / `[j]`:** Move selection down with view clamping and scroll synchronization.
+- **`[Enter]`:** Toggle Selected Bucket Detail Drawer (displays region, provider, oldest zombie upload timestamp, EODM count, lifecycle rule status, and ghost rule warnings).
+- **`[p]`:** Trigger background plan generation for selected bucket (`plan-<bucket>.json`), executing blast radius simulation and RFC 8785 cryptographic hash generation.
+- **`[r]`:** Asynchronously re-scan fleet metrics and refresh table data.
+- **`[q]` / `[Esc]` / `[Ctrl+C]`:** Cleanly teardown raw mode and restore terminal primary buffer.
+
+### 13.3 Pure State Machine Reducer
+The dashboard state is managed via a deterministic pure reducer `dashboardReducer(state, action)`:
+- `NAVIGATE_UP` / `NAVIGATE_DOWN`: Updates `selectedIndex` and shifts `scrollOffset` against `maxVisibleRows`.
+- `TOGGLE_DRAWER`: Flips `isDrawerOpen` boolean state.
+- `SET_STATUS`: Updates footer status message.
+- `SET_BUCKETS`: Ingests audited buckets, recalculates `totalMonthlyWasteUSD`, clamps `selectedIndex`, and resets `isLoading`.
+- `PLAN_CREATED`: Records `lastPlanPath` and updates status line with completion feedback.
+- `SET_LOADING`: Updates loading progress indicator.
+
+### 13.4 Storage Lens Instant Triage Integration
+When launched with `--lens <source>`, the dashboard bypasses live S3 bucket listing and immediately populates the fleet triage view from AWS Storage Lens CSV exports via `readStorageLensMetrics`, enabling instant macro-level governance with zero data-plane API overhead.

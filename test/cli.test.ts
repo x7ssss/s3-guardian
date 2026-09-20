@@ -67,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.4.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.5.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1451,6 +1451,43 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       );
       expect(successCode).toBe(0);
       expect(stdoutLogs.join("\n")).toContain("Multipart Upload cleanup summary:");
+    });
+  });
+
+  describe("Interactive Dashboard / TUI subcommand", () => {
+    it("dashboard rejects non-interactive terminal (non-TTY) with code 2", async () => {
+      const code = await main(["dashboard"], { ...captureIO, isTTY: false });
+      expect(code).toBe(2);
+      expect(stderrLogs.join("\n")).toContain("Interactive dashboard requires an interactive terminal (TTY)");
+      expect(stderrLogs.join("\n")).toContain("s3-guardian scan --all-buckets");
+    });
+
+    it("tui alias rejects non-interactive terminal (non-TTY) with code 2", async () => {
+      const code = await main(["tui"], { ...captureIO, isTTY: false });
+      expect(code).toBe(2);
+      expect(stderrLogs.join("\n")).toContain("Interactive dashboard requires an interactive terminal (TTY)");
+    });
+
+    it("dashboard launches and exits cleanly when TTY is true and abort signal is provided", async () => {
+      const ac = new AbortController();
+      ac.abort(); // already aborted signal exits dashboard immediately
+      const code = await main(["dashboard"], {
+        ...captureIO,
+        isTTY: true,
+        signal: ac.signal,
+      });
+      expect(code).toBe(0);
+    });
+
+    it("tui alias launches with --lens and exits cleanly with abort signal", async () => {
+      const ac = new AbortController();
+      ac.abort();
+      const code = await main(["tui", "--lens", "export.csv"], {
+        ...captureIO,
+        isTTY: true,
+        signal: ac.signal,
+      });
+      expect(code).toBe(0);
     });
   });
 });

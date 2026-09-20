@@ -35,7 +35,7 @@ import {
 import { readStorageLensMetrics } from "./lens/reader.js";
 import { StorageLensBucketMetrics } from "./lens/scorer.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads and versioning waste

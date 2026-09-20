@@ -66,7 +66,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.0.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.0.1");
   });
 
   it("prints help on --help or no args", async () => {

@@ -48,20 +48,26 @@ export async function readStorageLensMetrics(
     stream = createReadStream(fullPath);
   }
 
-  let metrics = await parseStorageLensCsvStream(stream);
+  try {
+    let metrics = await parseStorageLensCsvStream(stream);
 
-  // Filter by minimum waste threshold if configured
-  if (options.minWasteUSD !== undefined && options.minWasteUSD > 0) {
-    metrics = metrics.filter((m) => m.estimatedMonthlyWasteUSD >= options.minWasteUSD!);
+    // Filter by minimum waste threshold if configured
+    if (options.minWasteUSD !== undefined && options.minWasteUSD > 0) {
+      metrics = metrics.filter((m) => m.estimatedMonthlyWasteUSD >= options.minWasteUSD!);
+    }
+
+    // Sort descending by priority
+    const ranked = rankStorageLensMetrics(metrics);
+
+    // Slice to top N if specified
+    if (options.top !== undefined && options.top > 0) {
+      return ranked.slice(0, options.top);
+    }
+
+    return ranked;
+  } finally {
+    if (stream && typeof (stream as unknown as { destroy?: () => void }).destroy === "function") {
+      (stream as unknown as { destroy: () => void }).destroy();
+    }
   }
-
-  // Sort descending by priority
-  const ranked = rankStorageLensMetrics(metrics);
-
-  // Slice to top N if specified
-  if (options.top !== undefined && options.top > 0) {
-    return ranked.slice(0, options.top);
-  }
-
-  return ranked;
 }

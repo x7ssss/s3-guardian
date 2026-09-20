@@ -5,10 +5,12 @@ import {
   ObjectIdentifier,
 } from "@aws-sdk/client-s3";
 import { withRetry, isSlowDownError, RetryOptions } from "../utils/retry.js";
+import { S3Provider } from "../providers/detector.js";
 
 export interface TargetVersionIdentifier {
   Key: string;
   VersionId: string;
+  LastModified?: string | Date;
 }
 
 export interface CloudTrailCorrelationBatch {
@@ -21,6 +23,9 @@ export interface CloudTrailCorrelationBatch {
 export interface VersionExecutorOptions {
   confirm: boolean;
   bypassGovernance?: boolean;
+  provider?: S3Provider;
+  forceWasabiEarlyDelete?: boolean;
+  now?: Date;
   batchSize?: number;
   retryOptions?: RetryOptions;
   onProgress?: (
@@ -77,6 +82,27 @@ export async function executeVersionDeletion(
     throw new Error(
       "Safety check failed: The '--confirm' flag is strictly required to execute version deletions. No objects were deleted."
     );
+  }
+
+  // Wasabi 90-Day Retention Guard
+  if (options.provider === "wasabi" && !options.forceWasabiEarlyDelete) {
+    const now = options.now ?? new Date();
+    const nowTime = now.getTime();
+    const WASABI_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+    const youngVersions = entries.filter((e) => {
+      if (!e.LastModified) return false;
+      const ts =
+        e.LastModified instanceof Date
+          ? e.LastModified.getTime()
+          : new Date(e.LastModified).getTime();
+      return !isNaN(ts) && nowTime - ts < WASABI_RETENTION_MS;
+    });
+
+    if (youngVersions.length > 0) {
+      throw new Error(
+        "⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees."
+      );
+    }
   }
 
   const batchSize = Math.min(

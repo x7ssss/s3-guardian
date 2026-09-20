@@ -41,28 +41,8 @@ export interface UploadCoverageResult {
   daysAfterInitiation?: number;
 }
 
-// ─── Provider detection ───────────────────────────────────────────────────────
-
-/**
- * Detects if the endpoint is a local MinIO or Ceph instance.
- * MinIO does not support lifecycle MPU rules in the same way as AWS.
- */
-export function detectProvider(endpoint?: string | null): "minio" | "r2" | "aws" {
-  if (!endpoint) return "aws";
-  const lower = endpoint.toLowerCase();
-  if (
-    lower.includes("127.0.0.1") ||
-    lower.includes("localhost") ||
-    lower.includes("minio") ||
-    lower.includes("9000") // Default MinIO port heuristic
-  ) {
-    return "minio";
-  }
-  if (lower.includes("r2.cloudflarestorage.com") || lower.includes("r2.dev")) {
-    return "r2";
-  }
-  return "aws";
-}
+import { detectProvider, S3Provider } from "../providers/detector.js";
+export { detectProvider };
 
 // ─── Ghost Rule Detection ─────────────────────────────────────────────────────
 
@@ -210,6 +190,17 @@ export async function auditBucketLifecycle(
     };
   }
 
+  if (provider === "ceph") {
+    return {
+      bucketHasLifecyclePolicy: false,
+      hasCoveringRule: false,
+      mpuRules: [],
+      ghostRulesDetected: [],
+      providerNotes:
+        "Ceph RADOS Gateway detected. Lifecycle MPU abort rules behave differently from AWS S3; skipping lifecycle audit.",
+    };
+  }
+
   if (provider === "r2") {
     return {
       bucketHasLifecyclePolicy: true,
@@ -231,18 +222,22 @@ export async function auditBucketLifecycle(
         ),
       retryOptions
     );
-    rules = response.Rules ?? [];
+    rules = response?.Rules ?? [];
   } catch (err: unknown) {
     const errorObj = err as Record<string, unknown>;
     const name = String(errorObj.name || "");
     const status =
       (errorObj.$metadata as Record<string, unknown> | undefined)
-        ?.httpStatusCode;
+        ?.httpStatusCode ?? errorObj.statusCode;
 
-    // NoSuchLifecycleConfiguration is the expected error for buckets with no policy
+    // NoSuchLifecycleConfiguration or 404/405/501 (unsupported on custom providers)
     if (
       name === "NoSuchLifecycleConfiguration" ||
-      status === 404
+      name === "MethodNotAllowed" ||
+      name === "NotImplemented" ||
+      status === 404 ||
+      status === 405 ||
+      status === 501
     ) {
       return {
         bucketHasLifecyclePolicy: false,

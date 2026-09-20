@@ -4,6 +4,7 @@ import {
   GetBucketReplicationCommand,
   GetBucketTaggingCommand,
 } from "@aws-sdk/client-s3";
+import { S3Provider } from "../providers/detector.js";
 
 export type BlastRadiusRisk = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL_BLOCKED";
 
@@ -25,6 +26,8 @@ export interface BlastRadiusOptions {
   bypassGovernance?: boolean;
   acknowledgeReplicationDivergence?: boolean;
   allowActiveChurn?: boolean;
+  provider?: S3Provider;
+  forceWasabiEarlyDelete?: boolean;
   now?: Date;
 }
 
@@ -34,6 +37,7 @@ export interface BlastRadiusAssessment {
   isBlocked: boolean;
   requiresGovernanceBypass: boolean;
   requiresReplicationAck: boolean;
+  requiresWasabiEarlyDeleteBypass?: boolean;
   findings: BlastRadiusFinding[];
   objectLock?: {
     enabled: boolean;
@@ -72,12 +76,18 @@ function isNotFoundError(err: unknown): boolean {
 
   return (
     status === 404 ||
+    status === 405 ||
+    status === 501 ||
     name === "NoSuchObjectLockConfiguration" ||
     name === "ObjectLockConfigurationNotFoundError" ||
     name === "ReplicationConfigurationNotFoundError" ||
     name === "NoSuchReplicationConfiguration" ||
     name === "NoSuchTagSet" ||
-    name === "TagSetNotFoundError"
+    name === "TagSetNotFoundError" ||
+    name === "MethodNotAllowed" ||
+    name === "NotImplemented" ||
+    name === "UnsupportedArgument" ||
+    name === "InvalidRequest"
   );
 }
 
@@ -327,6 +337,48 @@ export async function assessBucketBlastRadius(
     }
   }
 
+  // ── Step 5b: Wasabi 90-Day Retention Guard ────────────────────────────────
+  let requiresWasabiEarlyDeleteBypass = false;
+  if (options.provider === "wasabi" && options.targets && options.targets.length > 0) {
+    const nowTime = now.getTime();
+    const WASABI_MIN_RETENTION_DAYS = 90;
+    const WASABI_RETENTION_MS = WASABI_MIN_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    let youngWasabiCount = 0;
+
+    for (const target of options.targets) {
+      if (!target.timestamp) continue;
+      const ts =
+        target.timestamp instanceof Date
+          ? target.timestamp.getTime()
+          : new Date(target.timestamp).getTime();
+
+      if (!isNaN(ts) && nowTime - ts < WASABI_RETENTION_MS) {
+        youngWasabiCount++;
+      }
+    }
+
+    if (youngWasabiCount > 0) {
+      if (!options.forceWasabiEarlyDelete) {
+        requiresWasabiEarlyDeleteBypass = true;
+        findings.push({
+          code: "HIGH_WASABI_RETENTION_RISK",
+          message:
+            "⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees.",
+          risk: "HIGH",
+          details: { youngWasabiCount, minRetentionDays: WASABI_MIN_RETENTION_DAYS },
+        });
+      } else {
+        findings.push({
+          code: "HIGH_WASABI_RETENTION_RISK",
+          message:
+            "⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees. (Overridden via --force-wasabi-early-delete)",
+          risk: "MEDIUM",
+          details: { youngWasabiCount, minRetentionDays: WASABI_MIN_RETENTION_DAYS },
+        });
+      }
+    }
+  }
+
   // ── Step 6: Derive Overall Risk Level ─────────────────────────────────────
   let riskLevel: BlastRadiusRisk = "LOW";
   if (findings.some((f) => f.risk === "CRITICAL_BLOCKED")) {
@@ -343,6 +395,7 @@ export async function assessBucketBlastRadius(
     isBlocked: riskLevel === "CRITICAL_BLOCKED",
     requiresGovernanceBypass,
     requiresReplicationAck,
+    requiresWasabiEarlyDeleteBypass,
     findings,
     objectLock: objectLockInfo,
     replication: replicationInfo,

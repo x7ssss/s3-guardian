@@ -57,7 +57,19 @@ export async function loadCheckpoint(
       })
     );
 
-    const bodyText = await response.Body?.transformToString();
+    let bodyText: string | undefined;
+    try {
+      bodyText = await response.Body?.transformToString();
+    } catch (err) {
+      if (
+        response.Body &&
+        typeof (response.Body as unknown as { destroy?: () => void }).destroy ===
+          "function"
+      ) {
+        (response.Body as unknown as { destroy: () => void }).destroy();
+      }
+      throw err;
+    }
     if (!bodyText) {
       return {
         completedBuckets: [],

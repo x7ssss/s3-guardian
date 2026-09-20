@@ -67,7 +67,7 @@ describe("CLI entrypoint and subcommand flow", () => {
   it("prints version on --version", async () => {
     const code = await main(["--version"], captureIO);
     expect(code).toBe(0);
-    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.3.0");
+    expect(stdoutLogs.join(" ")).toContain("s3-guardian v1.4.0");
   });
 
   it("prints help on --help or no args", async () => {
@@ -1304,6 +1304,153 @@ resource "aws_s3_bucket_lifecycle_configuration" "lifecycle_write_bucket" {
       // Verify file was mutated on disk
       const updatedContent = await fs.readFile(testTfFile, "utf8");
       expect(updatedContent).toContain("s3-guardian-abort-mpu");
+    });
+  });
+
+  describe("Multi-Cloud Provider CLI Flags & Wasabi Guard", () => {
+    const tmpDir = os.tmpdir();
+
+    it("displays [Provider: Cloudflare R2] banner when --provider r2 is active", async () => {
+      s3Mock.on(ListMultipartUploadsCommand).resolves({
+        Uploads: [],
+      });
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [],
+      });
+
+      const code = await main(["scan", "my-r2-bucket", "--provider", "r2"], captureIO);
+      expect(code).toBe(0);
+      expect(stdoutLogs.join("\n")).toContain("[Provider: Cloudflare R2]");
+    });
+
+    it("displays [Provider: Wasabi] banner when Wasabi endpoint is passed", async () => {
+      s3Mock.on(ListMultipartUploadsCommand).resolves({
+        Uploads: [],
+      });
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [],
+      });
+
+      const code = await main(
+        ["scan", "wasabi-bucket", "--endpoint", "https://s3.wasabisys.com"],
+        captureIO
+      );
+      expect(code).toBe(0);
+      expect(stdoutLogs.join("\n")).toContain("[Provider: Wasabi]");
+    });
+
+    it("displays [Provider: MinIO] banner when MinIO localhost:9000 endpoint is passed", async () => {
+      s3Mock.on(ListMultipartUploadsCommand).resolves({
+        Uploads: [],
+      });
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [],
+      });
+
+      const code = await main(
+        ["scan", "minio-bucket", "--endpoint", "http://localhost:9000"],
+        captureIO
+      );
+      expect(code).toBe(0);
+      expect(stdoutLogs.join("\n")).toContain("[Provider: MinIO]");
+    });
+
+    it("enforces Wasabi 90-day retention guard on apply and permits bypass with --force-wasabi-early-delete", async () => {
+      s3Mock.on(ListMultipartUploadsCommand).resolves({
+        Uploads: [],
+      });
+      s3Mock.on(GetBucketLifecycleConfigurationCommand).resolves({
+        Rules: [],
+      });
+
+      const planFilePath = path.join(tmpDir, "wasabi-plan.json");
+      const recentInitiated = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(); // 10 days old
+
+      // Create a plan file targeting Wasabi
+      const planCode = await main(
+        [
+          "plan",
+          "wasabi-test-bucket",
+          "--out",
+          planFilePath,
+          "--provider",
+          "wasabi",
+          "--endpoint",
+          "https://s3.wasabisys.com",
+        ],
+        captureIO
+      );
+      expect(planCode).toBe(0);
+
+      // Now inject a recent upload into the plan file and recompute hash
+      const planRaw = JSON.parse(await fs.readFile(planFilePath, "utf8"));
+      planRaw.uploads = [
+        {
+          key: "wasabi/active-churn.bin",
+          uploadId: "upl-wasabi-1",
+          initiated: recentInitiated,
+          partsCount: 1,
+          bytes: 1048576,
+          storageClass: "STANDARD",
+          lifecycleStatus: "UNPROTECTED",
+        },
+      ];
+      planRaw.totalZombieUploads = 1;
+      planRaw.totalStrandedBytes = 1048576;
+      planRaw.estimatedMonthlyWasteUSD = 0.023;
+
+      // Recompute integrity hash using canonical JCS
+      const { computePlanHash } = await import("../src/planner/jcs.js");
+      planRaw.planHash = computePlanHash({
+        schemaVersion: planRaw.schemaVersion,
+        bucket: planRaw.bucket,
+        endpoint: planRaw.endpoint,
+        olderThanDays: planRaw.olderThanDays,
+        uploads: planRaw.uploads,
+        versionDeletions: planRaw.versionDeletions,
+      });
+
+      await fs.writeFile(planFilePath, JSON.stringify(planRaw, null, 2), "utf8");
+
+      // Attempt apply without --force-wasabi-early-delete -> should be blocked with exit code 1
+      stderrLogs.length = 0;
+      stdoutLogs.length = 0;
+      const blockedCode = await main(
+        [
+          "apply",
+          "--plan",
+          planFilePath,
+          "--confirm",
+          "--provider",
+          "wasabi",
+          "--endpoint",
+          "https://s3.wasabisys.com",
+        ],
+        captureIO
+      );
+      expect(blockedCode).toBe(1);
+      expect(stderrLogs.join("\n")).toContain("Wasabi charges 90 days minimum retention");
+
+      // Now attempt apply WITH --force-wasabi-early-delete -> should succeed with exit code 0
+      s3Mock.on(AbortMultipartUploadCommand).resolves({});
+      stderrLogs.length = 0;
+      stdoutLogs.length = 0;
+      const successCode = await main(
+        [
+          "apply",
+          "--plan",
+          planFilePath,
+          "--confirm",
+          "--provider",
+          "wasabi",
+          "--endpoint",
+          "https://s3.wasabisys.com",
+          "--force-wasabi-early-delete",
+        ],
+        captureIO
+      );
+      expect(successCode).toBe(0);
+      expect(stdoutLogs.join("\n")).toContain("Multipart Upload cleanup summary:");
     });
   });
 });

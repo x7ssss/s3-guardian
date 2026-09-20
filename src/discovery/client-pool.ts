@@ -1,4 +1,6 @@
 import { S3Client, S3ClientConfig } from "@aws-sdk/client-s3";
+import { detectProvider } from "../providers/detector.js";
+import { configureProviderClient, applyProviderMiddleware } from "../providers/quirks.js";
 
 /**
  * A thread-safe, cached registry of S3Client instances keyed by AWS region.
@@ -7,6 +9,7 @@ import { S3Client, S3ClientConfig } from "@aws-sdk/client-s3";
  *  - One client per region is created lazily and reused for all requests.
  *  - `followRegionRedirects: false` keeps routing explicit; callers are
  *    responsible for resolving the correct region before dispatching.
+ *  - Configures provider-specific quirks and middleware when custom endpoints are provided.
  *  - `destroy()` tears down all regional clients cleanly (e.g. on process exit).
  */
 export class S3ClientPool {
@@ -38,10 +41,18 @@ export class S3ClientPool {
       return existing;
     }
 
-    const client = new S3Client({
-      ...this.baseConfig,
-      region,
-    });
+    const endpoint = (this.baseConfig as Record<string, unknown>).endpoint as string | undefined;
+    const provider = detectProvider(endpoint);
+    const configuredConfig = configureProviderClient(
+      {
+        ...this.baseConfig,
+        region,
+      },
+      provider
+    );
+
+    const client = new S3Client(configuredConfig);
+    applyProviderMiddleware(client, provider);
 
     this.clients.set(region, client);
     return client;

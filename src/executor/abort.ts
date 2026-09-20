@@ -2,6 +2,7 @@ import { S3Client, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { Plan, ZombieUploadItem, validatePlan, readPlanFile } from "../planner/plan.js";
 import { createConcurrencyLimiter } from "../utils/concurrency.js";
 import { withRetry, RetryOptions } from "../utils/retry.js";
+import { S3Provider } from "../providers/detector.js";
 
 export type AbortItemStatus = "ABORTED" | "SKIPPED_ALREADY_ABORTED" | "FAILED";
 
@@ -33,8 +34,11 @@ export interface AbortResult {
 
 export interface ExecuteOptions {
   confirm?: boolean;
+  provider?: S3Provider;
+  forceWasabiEarlyDelete?: boolean;
   concurrencyLimit?: number;
   retryOptions?: RetryOptions;
+  now?: Date;
   onProgress?: (
     completed: number,
     total: number,
@@ -89,6 +93,24 @@ export async function executeAbortPlan(
     typeof planOrPath === "string"
       ? await readPlanFile(planOrPath)
       : validatePlan(planOrPath);
+
+  // Wasabi 90-Day Retention Guard
+  if (options.provider === "wasabi" && !options.forceWasabiEarlyDelete) {
+    const now = options.now ?? new Date();
+    const nowTime = now.getTime();
+    const WASABI_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+    const youngUploads = plan.uploads.filter((u) => {
+      if (!u.initiated) return false;
+      const ts = new Date(u.initiated).getTime();
+      return !isNaN(ts) && nowTime - ts < WASABI_RETENTION_MS;
+    });
+
+    if (youngUploads.length > 0) {
+      throw new Error(
+        "⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees."
+      );
+    }
+  }
 
   const concurrencyLimit = Math.min(options.concurrencyLimit ?? 10, 10);
   const limiter = createConcurrencyLimiter(concurrencyLimit);

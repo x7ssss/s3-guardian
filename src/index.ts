@@ -55,7 +55,6 @@ export {
   auditBucketLifecycle,
   evaluateUploadCoverage,
   parseMpuRule,
-  detectProvider,
   LifecycleAuditResult,
   UploadCoverageResult,
   UploadLifecycleStatus,
@@ -238,5 +237,15 @@ export {
   LifecycleDriftResult,
   DriftStatus,
 } from "./drift/index.js";
+export {
+  detectProvider,
+  getProviderDisplayName,
+  configureProviderClient,
+  applyProviderMiddleware,
+  is405MethodNotAllowedError,
+  S3Provider,
+  KNOWN_PROVIDERS,
+  PROVIDER_REGEXES,
+} from "./providers/index.js";
 
 

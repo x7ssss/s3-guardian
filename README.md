@@ -1,11 +1,11 @@
 # s3-guardian
 
-[![npm version](https://img.shields.io/badge/npm-v1.3.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
+[![npm version](https://img.shields.io/badge/npm-v1.4.0-blue.svg)](https://www.npmjs.com/package/s3-guardian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(AWS%20SDK%20v3%20only)-success.svg)](https://github.com/x7ssss/s3-guardian)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
 
-Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned multipart uploads, noncurrent object versions, and lifecycle transition traps across AWS S3 and S3-compatible object stores (Cloudflare R2, MinIO).
+Enterprise-grade CLI and SDK to detect, quantify, and safely clean up abandoned multipart uploads, noncurrent object versions, and lifecycle transition traps across AWS S3 and multi-cloud S3 stores (Cloudflare R2, Wasabi, Backblaze B2, MinIO, Ceph).
 
 ---
 
@@ -349,10 +349,49 @@ Drift Details & Safety Gaps (2):
 
 ---
 
+## Multi-Cloud Provider Hardening (v1.4.0)
+
+`s3-guardian` automatically adapts to cross-cloud S3-compatible object storage backends via endpoint URL regex matching or explicit `--provider` specification:
+
+```bash
+# Explicit provider specification
+s3-guardian scan my-bucket --provider r2
+s3-guardian scan my-bucket --provider wasabi --endpoint https://s3.wasabisys.com
+s3-guardian scan my-bucket --provider minio --endpoint http://localhost:9000
+
+# Detected provider is displayed in the CLI banner:
+# [Provider: Cloudflare R2]
+# [Provider: Wasabi]
+# [Provider: MinIO]
+```
+
+### Supported Providers & Automated Quirks
+
+| Provider | Endpoint Pattern | Native Quirks Applied |
+| :--- | :--- | :--- |
+| **AWS S3** | `*.amazonaws.com` (or default) | Standard virtual-hosted routing, full SDK checksum support |
+| **Cloudflare R2** | `*.r2.cloudflarestorage.com`, `*.r2.dev` | Sets `requestChecksumCalculation: "WHEN_REQUIRED"`, default region `auto`; middleware strips unsupported `x-amz-sdk-checksum-algorithm` and `x-amz-checksum-crc32` headers |
+| **Wasabi** | `*.wasabisys.com` | Strict 90-day minimum retention guard (`--force-wasabi-early-delete` required for targets < 90 days) |
+| **Backblaze B2** | `*.backblazeb2.com` | Automatic path-style addressing (`forcePathStyle: true`) |
+| **MinIO** | `:9000`, `minio.*`, `localhost:9000` | Path-style addressing; deserializer middleware catches HTTP 405 MethodNotAllowed and yields safe fallback responses |
+| **Ceph RADOS GW**| `:7480`, `*.ceph.*` | Path-style addressing; middleware suppresses HTTP 405 MethodNotAllowed for unsupported extension queries |
+| **Custom S3** | Custom endpoint URL | Standard S3 compatibility fallback |
+
+### Wasabi 90-Day Retention Guard
+Wasabi enforces a **90-day minimum retention charge** on stored data. Prematurely deleting objects or incomplete multipart uploads younger than 90 days results in Timed Deleted Storage charges.
+- `s3-guardian` pre-flight blast radius simulation inspects target timestamps when `provider === "wasabi"`.
+- Targets `< 90` days old trip `HIGH_WASABI_RETENTION_RISK` and abort `apply`:
+  `⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees.`
+- To bypass when early deletion is intended, pass `--force-wasabi-early-delete`.
+
+---
+
 ## Full CLI Reference
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `--provider <name>` | string | auto | Target S3 provider (`aws`, `r2`, `wasabi`, `b2`, `minio`, `ceph`, `custom`) |
+| `--force-wasabi-early-delete` | flag | `false` | Bypass Wasabi 90-day retention guard for uploads/versions < 90 days old |
 | `--tf-file <path>` | string | — | Target Terraform `.tf` source file to compare against |
 | `--tfstate <path>` | string | — | Target `terraform.tfstate` JSON file |
 | `--patch` | flag | `false` | Output POSIX unified diff patch directly to stdout |
@@ -391,7 +430,7 @@ Drift Details & Safety Gaps (2):
 | Exit Code | Classification | Description |
 | :--- | :--- | :--- |
 | `0` | `SUCCESS` | Scan clean, plan generated, apply completed, or policies satisfied |
-| `1` | `POLICY_VIOLATION` | Safety gate tripped (Object Lock, churn, tampered plan) or CI/CD budget breached |
+| `1` | `POLICY_VIOLATION` | Safety gate tripped (Object Lock, churn, tampered plan, Wasabi retention) or CI/CD budget breached |
 | `2` | `ARG_ERROR` | Missing required parameters, invalid flags, or syntax error |
 | `3` | `DISCOVERY_AUTH_ERROR` | AWS Organizations discovery failure, STS AssumeRole denied, or missing credentials |
 
@@ -407,6 +446,7 @@ Drift Details & Safety Gaps (2):
 | **Protected State Prefixes** | `CRITICAL_BLOCKED` | Hard-blocks `checkpoints/`, `_wal/`, `iceberg/`, `manifests/`, `state/`. | None (Immutable) |
 | **Protected Bucket Tags** | `CRITICAL_BLOCKED` | Excludes `s3-guardian:ignore=true`, `Backup=true`, `Protection=locked`. | Remove tag in AWS |
 | **Active Pipeline Churn** | `HIGH` | Blocks deletion of uploads or versions initiated within 24 hours. | `--allow-active-churn` |
+| **Wasabi Early Deletion Guard** | `HIGH` | Blocks deletion of objects or uploads < 90 days old to avoid Timed Deleted fees. | `--force-wasabi-early-delete` |
 | **Plan Tampering** | `POLICY_VIOLATION` | RFC 8785 JCS canonicalization with SHA-256 target hash verification. | Re-generate plan |
 | **S3 503 Throttling** | Handled | Exponential backoff with full jitter (Decorrelated Jitter). | Automatic |
 
@@ -415,3 +455,4 @@ Drift Details & Safety Gaps (2):
 ## License
 
 MIT © Google Antigravity & contributors.
+

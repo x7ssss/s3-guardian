@@ -21,7 +21,7 @@ import { formatOrSaveIac, IacFormat } from "./remediation/iac.js";
 import { applyLifecycleRuleDirectly } from "./remediation/api.js";
 import { dispatchNotification, WebhookType } from "./notifications/dispatcher.js";
 import { scanObjectVersions, VersionScanResult } from "./versioning/scanner.js";
-import { executeVersionDeletion } from "./versioning/executor.js";
+import { executeVersionDeletion, TargetVersionIdentifier } from "./versioning/executor.js";
 import {
   resolveTargetAccounts,
   OrganizationsDiscoveryError,
@@ -55,10 +55,11 @@ import {
 import { ListBucketsCommand, GetBucketLocationCommand } from "@aws-sdk/client-s3";
 import { normalizeBucketRegion, US_EAST_1 } from "./discovery/regions.js";
 import { matchesExcludePattern } from "./fleet/scanner.js";
+import { detectProvider, getProviderDisplayName, S3Provider } from "./providers/index.js";
 import * as fsPromises from "node:fs/promises";
 import * as fsSync from "node:fs";
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 
 const HELP_TEXT = `
 s3-guardian v${VERSION} — Clean up abandoned S3 multipart uploads, versioning waste, and transition traps
@@ -116,6 +117,8 @@ OPTIONS:
   --bypass-governance          Bypass S3 Object Lock GOVERNANCE mode retention for version purges
   --acknowledge-replication-divergence Acknowledge replica divergence on buckets with active replication
   --allow-active-churn         Allow deletion of uploads or versions modified within 24 hours
+  --provider <name>            Target S3 provider: aws, r2, wasabi, b2, minio, ceph (autodetected if omitted)
+  --force-wasabi-early-delete  Bypass Wasabi 90-day retention guard for uploads or versions < 90 days old
   --endpoint <url>             Custom S3 endpoint URL (MinIO, Cloudflare R2, LocalStack)
   --force-path-style           Use S3 path-style addressing
   --region <region>            AWS Region (default: us-east-1 or AWS_REGION)
@@ -662,6 +665,8 @@ export async function main(
         "bypass-governance": { type: "boolean", default: false },
         "acknowledge-replication-divergence": { type: "boolean", default: false },
         "allow-active-churn": { type: "boolean", default: false },
+        provider: { type: "string" },
+        "force-wasabi-early-delete": { type: "boolean", default: false },
         endpoint: { type: "string" },
         "force-path-style": { type: "boolean", default: false },
         region: { type: "string" },
@@ -800,8 +805,16 @@ export async function main(
     }
   }
 
+  const providerFlag = getString(values.provider);
+  const detectedProvider = detectProvider(endpoint, providerFlag);
+  const forceWasabiEarlyDelete = values["force-wasabi-early-delete"] === true;
+
   const policyOptions: PolicyOptions = { maxWasteUSD, failOnUnprotected };
-  const clientConfig = { region, endpoint, forcePathStyle };
+  const clientConfig = { region, endpoint, forcePathStyle, provider: detectedProvider };
+
+  if ((endpoint || providerFlag) && !isJson && !isGitHub) {
+    log(`[Provider: ${getProviderDisplayName(detectedProvider)}]`);
+  }
 
   // ════════════════════════════════════════════════════════════════════════════
   switch (command) {
@@ -1988,6 +2001,8 @@ export async function main(
         bypassGovernance: values["bypass-governance"] === true,
         acknowledgeReplicationDivergence: values["acknowledge-replication-divergence"] === true,
         allowActiveChurn: values["allow-active-churn"] === true,
+        provider: detectedProvider,
+        forceWasabiEarlyDelete,
         now,
       });
 
@@ -2265,10 +2280,13 @@ export async function main(
         log(`\n⚠️  ${plan.highVolumeWarning}`);
       }
 
+      const effectiveEndpoint = endpoint ?? plan.endpoint ?? undefined;
+      const effectiveProvider = detectProvider(effectiveEndpoint, providerFlag);
       const effectiveClientConfig = {
         region,
-        endpoint: endpoint ?? plan.endpoint ?? undefined,
+        endpoint: effectiveEndpoint,
         forcePathStyle,
+        provider: effectiveProvider,
       };
       const client = createS3Client(effectiveClientConfig);
 
@@ -2288,6 +2306,8 @@ export async function main(
         bypassGovernance: bypassGov,
         acknowledgeReplicationDivergence: ackRepl,
         allowActiveChurn: allowChurn,
+        provider: effectiveProvider,
+        forceWasabiEarlyDelete,
       });
 
       if (blastRadius.isBlocked) {
@@ -2311,6 +2331,13 @@ export async function main(
         return EXIT_CODES.POLICY_VIOLATION;
       }
 
+      if (blastRadius.requiresWasabiEarlyDeleteBypass) {
+        error(`\n❌ Wasabi 90-day retention guard triggered on bucket '${plan.bucket}':`);
+        error(`   ⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees.`);
+        error(`   Pass '--force-wasabi-early-delete' to proceed.`);
+        return EXIT_CODES.POLICY_VIOLATION;
+      }
+
       const unacknowledgedHigh = blastRadius.findings.filter((f) => f.risk === "HIGH");
       if (unacknowledgedHigh.length > 0) {
         error(`\n❌ Pre-flight safety check failed (HIGH risk detected):`);
@@ -2327,6 +2354,8 @@ export async function main(
         log(`Executing abort operations for bucket '${plan.bucket}' (${plan.uploads.length} upload(s))...`);
         const abortResult = await executeAbortPlan(client, plan, {
           confirm: true,
+          provider: effectiveProvider,
+          forceWasabiEarlyDelete,
           onProgress: (completed, total, item, status, correlation) => {
             const trace = correlation?.requestId
               ? ` [x-amz-request-id: ${correlation.requestId}]`
@@ -2362,9 +2391,10 @@ export async function main(
       // 2. Execute version deletions
       if (hasVersions) {
         log(`\nExecuting version deletions for bucket '${plan.bucket}' (${plan.versionDeletions!.length} item(s))...`);
-        const entries = plan.versionDeletions!.map((v) => ({
+        const entries: TargetVersionIdentifier[] = plan.versionDeletions!.map((v) => ({
           Key: v.key,
           VersionId: v.versionId,
+          LastModified: v.lastModified,
         }));
 
         const passBypassGov = Boolean(
@@ -2378,6 +2408,8 @@ export async function main(
           {
             confirm: true,
             bypassGovernance: passBypassGov,
+            provider: effectiveProvider,
+            forceWasabiEarlyDelete,
             onProgress: (deleted, total, correlation) => {
               const trace = correlation?.requestId
                 ? ` [x-amz-request-id: ${correlation.requestId}]`

@@ -351,3 +351,52 @@ The `parseTerraformState` engine reads raw `terraform.tfstate` JSON:
   - **Missing Rules:** Rule declared in IaC but absent in live AWS S3.
   - **Threshold Drifts:** Days after initiation, noncurrent days, status, or transition targets differ.
   - **Safety Gaps:** Bucket lacks an MPU abort rule in IaC, or transition rules lack small-object filters.
+
+---
+
+## 12. Cross-Cloud S3 Provider Hardening & Wasabi Retention Guard (v1.4.0)
+
+### 12.1 Provider Autodetection & Endpoint Regexes
+The CLI and SDK support multi-cloud S3-compatible backends with automatic provider detection (`src/providers/detector.ts`):
+- **Explicit Override:** `--provider <aws|r2|wasabi|b2|minio|ceph|custom>` overrides regex autodetection.
+- **Endpoint Regex Matching:**
+  - **Cloudflare R2:** `/\.r2\.cloudflarestorage\.com|\.r2\.dev/i`
+  - **Wasabi:** `/\.wasabisys\.com/i`
+  - **Backblaze B2:** `/\.backblazeb2\.com/i`
+  - **MinIO:** `/:9000$|:9000\/|minio\./i` (or `localhost:9000` / `127.0.0.1:9000`)
+  - **Ceph RADOS Gateway:** `/:7480$|:7480\/|\.ceph\.|ceph\./i`
+  - **AWS S3:** `/\.amazonaws\.com/i` or fallback when no custom endpoint is provided.
+  - **Custom S3:** Any other unmapped custom endpoint.
+
+### 12.2 Provider Quirks & Client Configuration
+`configureProviderClient` tailors the `S3ClientConfig` according to target provider semantics:
+1. **Cloudflare R2:**
+   - Withholds unsupported SDK-generated checksum calculations by configuring `requestChecksumCalculation: "WHEN_REQUIRED"` and `responseChecksumValidation: "WHEN_REQUIRED"`.
+   - Defaults region to `'auto'` (if unspecified or `us-east-1`).
+2. **MinIO, Ceph, and Backblaze B2:**
+   - Enforces S3 path-style addressing (`forcePathStyle: true`).
+3. **AWS S3 & Custom:**
+   - Preserves standard virtual-hosted style addressing and regional routing.
+
+### 12.3 Provider Middleware Pipeline
+`applyProviderMiddleware` attaches custom middleware into the `@aws-sdk/client-s3` middleware stack:
+1. **R2 Checksum Header Stripping (`finalizeRequest` step):**
+   - Intercepts outgoing HTTP requests and strips `x-amz-sdk-checksum-algorithm` and `x-amz-checksum-crc32` headers case-insensitively before transmission, preventing R2 from rejecting requests with `400 InvalidArgument`.
+2. **Ceph / MinIO 405 Suppression (`deserialize` step):**
+   - Catches HTTP `405 MethodNotAllowed` errors returned by Ceph RADOS Gateway or MinIO for unsupported S3 extensions (such as `GetObjectLockConfiguration` or `GetBucketLifecycleConfiguration`).
+   - Translates the error into a safe empty response payload with `$metadata.httpStatusCode = 405`, preventing fatal process termination during blast radius audits and drift scans.
+
+### 12.4 Zero Socket Leaks (Invariant 2)
+All operations consuming S3 object streams (such as `GetObjectCommand` in Storage Lens readers and S3 checkpoint loaders) wrap stream consumption in a `try / finally` block that unconditionally calls `(stream as any).destroy()` on termination or error, preventing keep-alive socket starvation.
+
+### 12.5 Wasabi 90-Day Retention Guard (FinOps Safety)
+Wasabi enforces a strict 90-day minimum retention charge policy: deleting objects or multipart uploads younger than 90 days results in Timed Deleted Storage fees equal to the remaining retention duration.
+1. **Pre-flight Blast Radius Simulation:**
+   - When `provider === "wasabi"`, targets in the deletion list are checked for initiation / last-modified timestamp.
+   - If any target is less than 90 days old (`age < 90 * 24 * 60 * 60 * 1000`), the blast radius assessor raises `HIGH_WASABI_RETENTION_RISK` (`risk: "HIGH"`), flagging `requiresWasabiEarlyDeleteBypass = true`.
+2. **Execution Gate:**
+   - `apply` aborts execution with exit code 1 (`POLICY_VIOLATION`), emitting the warning:
+     `"⚠️ Wasabi charges 90 days minimum retention. Deleting objects < 90 days old triggers Timed Deleted Storage fees."`
+   - Bypassing this safety gate strictly requires the `--force-wasabi-early-delete` flag.
+3. **Executor-Level Enforcement:**
+   - Both `executeAbortPlan` and `executeVersionDeletion` directly enforce the Wasabi 90-day check, throwing a descriptive safety error if young targets are passed without `forceWasabiEarlyDelete: true`.
